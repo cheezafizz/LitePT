@@ -9,6 +9,7 @@ num_worker = 16  # total worker in all gpu
 batch_size = 16  # total batch size in all gpu
 batch_size_val = None  # auto adapt to bs 1 for each gpu
 batch_size_test = None  # auto adapt to bs 1 for each gpu
+val_subset_size = None  # if set, validation uses only the first N scenes of the val split
 epoch = 100  # total epoch, data loop = epoch // eval_epoch
 eval_epoch = 100  # sche total eval & checkpoint epoch
 clip_grad = None  # disable with None, enable with a float
@@ -21,8 +22,9 @@ empty_cache_per_epoch = False
 find_unused_parameters = False
 
 enable_wandb = True
-wandb_project = "LitePT"  # wandb project name 
+wandb_project = "LitePT"  # wandb project name
 wandb_key = None # wandb token, default is None. If None, login with `wandb login` in your terminal
+wandb_log_interval = 1  # log per-step train metrics to wandb every N steps (1 = every step)
 
 mix_prob = 0
 param_dicts = None  # example: param_dicts = [dict(keyword="block", lr_scale=0.1)]

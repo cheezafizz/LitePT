@@ -1,2 +1,5 @@
 data
 exp
+*.json
+*.pyc
+*.glb

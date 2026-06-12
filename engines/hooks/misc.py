@@ -92,6 +92,9 @@ class InformationWriter(HookBase):
     def before_train(self):
         self.trainer.comm_info["iter_info"] = ""
         self.curr_iter = self.trainer.start_epoch * len(self.trainer.train_loader)
+        # Per-step wandb logging cadence. 1 = log every step (legacy). On long runs
+        # (~847k steps) logging every step floods the wandb client; throttle via config.
+        self.wandb_log_interval = getattr(self.trainer.cfg, "wandb_log_interval", 1)
         if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
             wandb.define_metric("params/*", step_metric="global_step")
             wandb.define_metric("train_batch/*", step_metric="global_step")
@@ -137,27 +140,20 @@ class InformationWriter(HookBase):
                     self.trainer.storage.history(key).val,
                     self.curr_iter,
                 )
-            if self.trainer.cfg.enable_wandb:
-
-                wandb.log(
-                    {"global_step": self.curr_iter, 
-                     "params/lr": lr,
-                     "params/norm": self.compute_total_grad_norm(self.trainer.model.parameters(), norm_type=2.0),
-                    #  "params/mask_size": self.trainer.model.module.mask_size,
-                    #  "params/mask_ratio": self.trainer.model.module.mask_ratio,
-                    #  "params/teacher_temp": self.trainer.model.module.teacher_temp,
-                    #  "params/ema_momentum": self.trainer.model.module.momentum,
-                    #  "params/weight_decay": self.trainer.optimizer.state_dict()["param_groups"][0]["weight_decay"]
-                     }, step=self.curr_iter
-                )
+            if (
+                self.trainer.cfg.enable_wandb
+                and self.curr_iter % self.wandb_log_interval == 0
+            ):
+                # compute_total_grad_norm reduces over all params; only pay it on
+                # steps we actually log to wandb.
+                log_dict = {
+                    "global_step": self.curr_iter,
+                    "params/lr": lr,
+                    "params/norm": self.compute_total_grad_norm(self.trainer.model.parameters(), norm_type=2.0),
+                }
                 for key in self.model_output_keys:
-                    wandb.log(
-                        {
-                            "global_step": self.curr_iter,
-                            f"train_batch/{key}": self.trainer.storage.history(key).val,
-                        },
-                        step=wandb.run.step,
-                    )
+                    log_dict[f"train_batch/{key}"] = self.trainer.storage.history(key).val
+                wandb.log(log_dict, step=self.curr_iter)
 
     def after_epoch(self):
         epoch_info = "Train result: "
@@ -175,15 +171,10 @@ class InformationWriter(HookBase):
                 )
 
             if self.trainer.cfg.enable_wandb:
-
+                log_dict = {"epoch": self.trainer.epoch + 1}
                 for key in self.model_output_keys:
-                    wandb.log(
-                        {
-                            "epoch": self.trainer.epoch + 1,
-                            f"train/{key}": self.trainer.storage.history(key).avg,
-                        },
-                        step=wandb.run.step,
-                    )
+                    log_dict[f"train/{key}"] = self.trainer.storage.history(key).avg
+                wandb.log(log_dict)
 
 
 @HOOKS.register_module()
@@ -195,21 +186,27 @@ class CheckpointSaver(HookBase):
         if is_main_process():
             is_best = False
             if self.trainer.cfg.evaluate:
-                current_metric_value = self.trainer.comm_info["current_metric_value"]
-                current_metric_name = self.trainer.comm_info["current_metric_name"]
-                if current_metric_value > self.trainer.best_metric_value:
-                    self.trainer.best_metric_value = current_metric_value
-                    is_best = True
+                current_metric_value = self.trainer.comm_info.get("current_metric_value")
+                current_metric_name = self.trainer.comm_info.get("current_metric_name")
+                if current_metric_value is None:
+                    # Step-interval evaluation hasn't produced a metric yet; skip best-tracking.
                     self.trainer.logger.info(
-                        "Best validation {} updated to: {:.4f}".format(
-                            current_metric_name, current_metric_value
+                        "No validation metric available this epoch; skipping best-model update."
+                    )
+                else:
+                    if current_metric_value > self.trainer.best_metric_value:
+                        self.trainer.best_metric_value = current_metric_value
+                        is_best = True
+                        self.trainer.logger.info(
+                            "Best validation {} updated to: {:.4f}".format(
+                                current_metric_name, current_metric_value
+                            )
+                        )
+                    self.trainer.logger.info(
+                        "Currently Best {}: {:.4f}".format(
+                            current_metric_name, self.trainer.best_metric_value
                         )
                     )
-                self.trainer.logger.info(
-                    "Currently Best {}: {:.4f}".format(
-                        current_metric_name, self.trainer.best_metric_value
-                    )
-                )
 
             filename = os.path.join(
                 self.trainer.cfg.save_path, "model", "model_last.pth"

@@ -1,4 +1,6 @@
 import os
+import re
+import gc
 import numpy as np
 import wandb
 import torch
@@ -111,16 +113,17 @@ class SemSegEvaluator(HookBase):
             self.trainer.writer.add_scalar("val/mAcc", m_acc, current_epoch)
             self.trainer.writer.add_scalar("val/allAcc", all_acc, current_epoch)
             if self.trainer.cfg.enable_wandb:
-                wandb.log(
-                    {
-                        "Epoch": current_epoch,
-                        "val/loss": loss_avg,
-                        "val/mIoU": m_iou,
-                        "val/mAcc": m_acc,
-                        "val/allAcc": all_acc,
-                    },
-                    step=wandb.run.step,
-                )
+                log_dict = {
+                    "Epoch": current_epoch,
+                    "val/loss": loss_avg,
+                    "val/mIoU": m_iou,
+                    "val/mAcc": m_acc,
+                    "val/allAcc": all_acc,
+                }
+                if self.write_cls_iou:
+                    for i in range(self.trainer.cfg.data.num_classes):
+                        log_dict[f"val/cls_{i}-{self.trainer.cfg.data.names[i]} IoU"] = iou_class[i]
+                wandb.log(log_dict)
             if self.write_cls_iou:
                 for i in range(self.trainer.cfg.data.num_classes):
                     self.trainer.writer.add_scalar(
@@ -128,17 +131,6 @@ class SemSegEvaluator(HookBase):
                         iou_class[i],
                         current_epoch,
                     )
-                if self.trainer.cfg.enable_wandb:
-                    for i in range(self.trainer.cfg.data.num_classes):
-                        wandb.log(
-                            {
-                                "Epoch": current_epoch,
-                                f"val/cls_{i}-{self.trainer.cfg.data.names[i]} IoU": iou_class[
-                                    i
-                                ],
-                            },
-                            step=wandb.run.step,
-                        )
         self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
         self.trainer.comm_info["current_metric_value"] = m_iou  # save for saver
         self.trainer.comm_info["current_metric_name"] = "mIoU"  # save for saver
@@ -156,7 +148,7 @@ class InsSegEvaluator(HookBase):
 
         self.valid_class_names = None  # update in before train
         self.overlaps = np.append(np.arange(0.5, 0.95, 0.05), 0.25)
-        self.min_region_sizes = 100
+        self.min_region_sizes = 50
         self.distance_threshes = float("inf")
         self.distance_confs = -float("inf")
 
@@ -166,15 +158,36 @@ class InsSegEvaluator(HookBase):
             for i in range(self.trainer.cfg.data.num_classes)
             if i not in self.segment_ignore_index
         ]
+        self.steps_per_epoch = len(self.trainer.train_loader)
+        self.eval_step_interval = getattr(self.trainer.cfg, "eval_step_interval", None)
+        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
+            wandb.define_metric("val/*", step_metric="global_step")
 
     def after_epoch(self):
-        if self.trainer.cfg.evaluate:
+        if self.trainer.cfg.evaluate and self.eval_step_interval is None:
             self.eval()
+            self.trainer.model.train()
+
+    def after_step(self):
+        if not self.trainer.cfg.evaluate or self.eval_step_interval is None:
+            return
+        global_step = (
+            self.trainer.epoch * self.steps_per_epoch
+            + self.trainer.comm_info["iter"]
+            + 1
+        )
+        if global_step % self.eval_step_interval != 0:
+            return
+        for key in list(self.trainer.storage.histories().keys()):
+            if key.startswith("val_"):
+                self.trainer.storage.history(key).reset()
+        self.eval()
+        self.trainer.model.train()
 
     def associate_instances(self, pred, segment, instance):
         segment = segment.cpu().numpy()
         instance = instance.cpu().numpy()
-        void_mask = np.in1d(segment, self.segment_ignore_index)
+        void_mask = np.isin(segment, self.segment_ignore_index)
 
         assert (
             pred["pred_classes"].shape[0]
@@ -244,6 +257,23 @@ class InsSegEvaluator(HookBase):
             pred_inst["matched_gt"] = matched_gt
             pred_instances[segment_name].append(pred_inst)
             instance_id += 1
+
+        # Drop the full-resolution boolean masks before returning. They are only
+        # needed for the per-scene intersection bookkeeping above; evaluate_matches
+        # works purely off the scalar fields (intersection / vert_count /
+        # void_intersection / confidence). Keeping them would accumulate one mask
+        # per predicted instance (~num_points bytes each) across every scene in
+        # `scenes`, which exhausts host RAM on large val sets (e.g. the 6350-scene
+        # v1.1.1 split) and stalls evaluation via swapping. The masks live both in
+        # pred_instances and in the shallow copies referenced from
+        # gt_instances[...]["matched_pred"], so strip both to actually free them.
+        for label_name in pred_instances:
+            for pred_inst in pred_instances[label_name]:
+                pred_inst.pop("mask", None)
+        for label_name in gt_instances:
+            for gt_inst in gt_instances[label_name]:
+                for matched_pred in gt_inst["matched_pred"]:
+                    matched_pred.pop("mask", None)
         return gt_instances, pred_instances
 
     def evaluate_matches(self, scenes):
@@ -450,6 +480,91 @@ class InsSegEvaluator(HookBase):
             )
         return ap_scores
 
+    def _save_viz(self, scene_idx, input_dict, output_dict, idx):
+        from .insseg_viz import (
+            voxel_downsample_indices,
+            instance_palette,
+            colorize_predicted_instances,
+            colorize_gt_instances,
+            save_pointcloud_glb,
+        )
+
+        coord = input_dict["origin_coord"].detach().cpu().numpy()
+        # The val Collect concatenates color+normal into `feat` (cols 0-2 = color, 3-5 = normal)
+        color_voxel = input_dict["feat"][:, :3].detach().cpu().numpy()
+        idx_np = idx.cpu().numpy() if hasattr(idx, "cpu") else np.asarray(idx)
+        color = np.clip(color_voxel[idx_np] * 255.0, 0, 255).astype(np.uint8)
+
+        pred = output_dict["pred_masks"].detach().cpu().numpy().astype(bool)
+        scores = output_dict["pred_scores"].detach().cpu().numpy()
+        gt_inst = input_dict["origin_instance"].detach().cpu().numpy()
+
+        # AABBs computed on the full origin coord (before downsampling) so boxes hug true extents.
+        # Filter uses self.min_region_sizes — same threshold the evaluator applies for AP matching.
+        P = pred.shape[0]
+        palette_pred = instance_palette(P)
+        pred_boxes = []
+        for p_idx in range(P):
+            m = pred[p_idx]
+            if m.sum() < self.min_region_sizes:
+                continue
+            pts = coord[m]
+            pred_boxes.append((pts.min(0), pts.max(0), palette_pred[p_idx]))
+
+        uniq_gt = np.unique(gt_inst[gt_inst != self.instance_ignore_index])
+        palette_gt = instance_palette(len(uniq_gt), seed=1)
+        gt_boxes = []
+        for k, inst in enumerate(uniq_gt):
+            m = gt_inst == inst
+            if m.sum() < self.min_region_sizes:
+                continue
+            pts = coord[m]
+            gt_boxes.append((pts.min(0), pts.max(0), palette_gt[k]))
+
+        kept = voxel_downsample_indices(coord, 0.005)
+        coord_s = coord[kept]
+        color_s = color[kept]
+        pred_s = pred[:, kept] if pred.shape[0] > 0 else pred
+        gt_inst_s = gt_inst[kept]
+
+        pred_color = colorize_predicted_instances(coord_s.shape[0], pred_s, scores)
+        gt_color = colorize_gt_instances(
+            gt_inst_s, ignore_value=self.instance_ignore_index
+        )
+
+        raw_name = input_dict.get("name", None)
+        if isinstance(raw_name, (list, tuple)) and raw_name:
+            raw_name = raw_name[0]
+        if isinstance(raw_name, bytes):
+            raw_name = raw_name.decode()
+        if isinstance(raw_name, str) and raw_name:
+            scene_tag = os.path.splitext(os.path.basename(raw_name))[0]
+            scene_tag = re.sub(r"[^A-Za-z0-9._-]", "_", scene_tag)
+        else:
+            scene_tag = "scene{}".format(scene_idx)
+
+        project_name = os.path.basename(os.path.normpath(self.trainer.cfg.save_path))
+        base = os.path.join("/home/fai/workspace/jhp/LitePT/eval", project_name)
+        ep = self.trainer.epoch + 1
+        out_dir = os.path.join(base, "epoch_{:04d}".format(ep))
+        save_pointcloud_glb(
+            os.path.join(out_dir, "{}_rgb.glb".format(scene_tag)),
+            coord_s,
+            color_s,
+        )
+        save_pointcloud_glb(
+            os.path.join(out_dir, "{}_pred.glb".format(scene_tag)),
+            coord_s,
+            pred_color,
+            boxes=pred_boxes,
+        )
+        save_pointcloud_glb(
+            os.path.join(out_dir, "{}_gt.glb".format(scene_tag)),
+            coord_s,
+            gt_color,
+            boxes=gt_boxes,
+        )
+
     def eval(self):
         self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
         self.trainer.model.eval()
@@ -465,6 +580,10 @@ class InsSegEvaluator(HookBase):
                 output_dict = self.trainer.model(input_dict)
 
             loss = output_dict["loss"]
+            loss_keys = [
+                k for k in ("loss", "seg_loss", "bias_l1_loss", "bias_cosine_loss")
+                if k in output_dict
+            ]
 
             segment = input_dict["segment"]
             instance = input_dict["instance"]
@@ -482,12 +601,21 @@ class InsSegEvaluator(HookBase):
                 segment = input_dict["origin_segment"]
                 instance = input_dict["origin_instance"]
 
+            if comm.get_rank() == 0 and i < 5 and "origin_coord" in input_dict:
+                try:
+                    self._save_viz(i, input_dict, output_dict, idx)
+                except Exception as exc:
+                    self.trainer.logger.warning(
+                        "viz save failed at scene {idx}: {err}".format(idx=i, err=exc)
+                    )
+
             gt_instances, pred_instance = self.associate_instances(
                 output_dict, segment, instance
             )
             scenes.append(dict(gt=gt_instances, pred=pred_instance))
 
-            self.trainer.storage.put_scalar("val_loss", loss.item())
+            for key in loss_keys:
+                self.trainer.storage.put_scalar(f"val_{key}", output_dict[key].item())
             self.trainer.logger.info(
                 "Test: [{iter}/{max_iter}] "
                 "Loss {loss:.4f} ".format(
@@ -496,6 +624,11 @@ class InsSegEvaluator(HookBase):
             )
 
         loss_avg = self.trainer.storage.history("val_loss").avg
+        loss_component_avg = {
+            key: self.trainer.storage.history(f"val_{key}").avg
+            for key in ("seg_loss", "bias_l1_loss", "bias_cosine_loss")
+            if f"val_{key}" in self.trainer.storage.histories()
+        }
         comm.synchronize()
         scenes_sync = comm.gather(scenes, dst=0)
         scenes = [scene for scenes_ in scenes_sync for scene in scenes_]
@@ -520,19 +653,49 @@ class InsSegEvaluator(HookBase):
         current_epoch = self.trainer.epoch + 1
         if self.trainer.writer is not None:
             self.trainer.writer.add_scalar("val/loss", loss_avg, current_epoch)
+            for key, value in loss_component_avg.items():
+                self.trainer.writer.add_scalar(f"val/{key}", value, current_epoch)
             self.trainer.writer.add_scalar("val/mAP", all_ap, current_epoch)
             self.trainer.writer.add_scalar("val/AP50", all_ap_50, current_epoch)
             self.trainer.writer.add_scalar("val/AP25", all_ap_25, current_epoch)
-            if self.trainer.cfg.enable_wandb:
-                wandb.log(
-                    {
-                        "Epoch": current_epoch,
-                        "val/mAP": all_ap,
-                        "val/AP50": all_ap_50,
-                        "val/AP25": all_ap_25,
-                    },
-                    step=wandb.run.step,
+            for label_name in self.valid_class_names:
+                cls = ap_scores["classes"][label_name]
+                self.trainer.writer.add_scalar(
+                    f"val/AP_{label_name}", cls["ap"], current_epoch
                 )
+                self.trainer.writer.add_scalar(
+                    f"val/AP50_{label_name}", cls["ap50%"], current_epoch
+                )
+                self.trainer.writer.add_scalar(
+                    f"val/AP25_{label_name}", cls["ap25%"], current_epoch
+                )
+            if self.trainer.cfg.enable_wandb:
+                global_step = (
+                    self.trainer.epoch * self.steps_per_epoch
+                    + self.trainer.comm_info.get("iter", -1)
+                    + 1
+                )
+                log_dict = {
+                    "global_step": global_step,
+                    "Epoch": current_epoch,
+                    "val/loss": loss_avg,
+                    "val/mAP": all_ap,
+                    "val/AP50": all_ap_50,
+                    "val/AP25": all_ap_25,
+                }
+                for key, value in loss_component_avg.items():
+                    log_dict[f"val/{key}"] = value
+                for label_name in self.valid_class_names:
+                    cls = ap_scores["classes"][label_name]
+                    log_dict[f"val/AP_{label_name}"] = cls["ap"]
+                    log_dict[f"val/AP50_{label_name}"] = cls["ap50%"]
+                    log_dict[f"val/AP25_{label_name}"] = cls["ap25%"]
+                wandb.log(log_dict)
         self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
         self.trainer.comm_info["current_metric_value"] = all_ap_50  # save for saver
         self.trainer.comm_info["current_metric_name"] = "AP50"  # save for saver
+        # Release the per-eval buffers promptly (one bookkeeping dict per val scene)
+        # so they don't linger until the next eval and inflate the memory peak.
+        del scenes, scenes_sync, ap_scores
+        gc.collect()
+        torch.cuda.empty_cache()

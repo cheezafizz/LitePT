@@ -340,24 +340,14 @@ class SemSegTester(TesterBase):
                 )
             logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
             if self.cfg.enable_wandb:
-                wandb.log(
-                    {
-                        "test/mIoU": mIoU,
-                        "test/mAcc": mAcc,
-                        "test/allAcc": allAcc,
-                    },
-                    step=wandb.run.step,
-                )
-
+                log_dict = {
+                    "test/mIoU": mIoU,
+                    "test/mAcc": mAcc,
+                    "test/allAcc": allAcc,
+                }
                 for i in range(self.cfg.data.num_classes):
-                    wandb.log(
-                        {
-                            f"test/cls_{i}-{self.cfg.data.names[i]} IoU": iou_class[
-                                i
-                            ],
-                        },
-                        step=wandb.run.step,
-                    )
+                    log_dict[f"test/cls_{i}-{self.cfg.data.names[i]} IoU"] = iou_class[i]
+                wandb.log(log_dict)
 
     @staticmethod
     def collate_fn(batch):
@@ -724,24 +714,14 @@ class SemSegTester_Assemble(TesterBase_Assemble):
             logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
 
             if self.cfg.enable_wandb:
-                wandb.log(
-                    {
-                        "test/mIoU": mIoU,
-                        "test/mAcc": mAcc,
-                        "test/allAcc": allAcc,
-                    },
-                    step=wandb.run.step,
-                )
-
+                log_dict = {
+                    "test/mIoU": mIoU,
+                    "test/mAcc": mAcc,
+                    "test/allAcc": allAcc,
+                }
                 for i in range(self.cfg.data.num_classes):
-                    wandb.log(
-                        {
-                            f"test/cls_{i}-{self.cfg.data.names[i]} IoU": iou_class[
-                                i
-                            ],
-                        },
-                        step=wandb.run.step,
-                    )
+                    log_dict[f"test/cls_{i}-{self.cfg.data.names[i]} IoU"] = iou_class[i]
+                wandb.log(log_dict)
 
     @staticmethod
     def collate_fn(batch):

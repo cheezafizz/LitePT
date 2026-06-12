@@ -35,6 +35,13 @@ AMP_DTYPE = dict(
 
 class TrainerBase:
     def __init__(self) -> None:
+        # The val loader streams full-resolution scenes (no SphereCrop) worker->main
+        # through the multiprocessing queue. PyTorch's default "file_descriptor"
+        # sharing strategy fails partway through eval in _share_fd_cpu_ (surfacing as
+        # a mangled `AttributeError: 'super' object has no attribute 'super'`). Use
+        # "file_system" sharing -- backed by /tmp files instead of shm fds -- matching
+        # TesterBase. Set in the main process so spawned DataLoader workers inherit it.
+        torch.multiprocessing.set_sharing_strategy("file_system")
         self.hooks = []
         self.model = None
         self.epoch = 0
@@ -111,6 +118,11 @@ class TrainerBase:
             h.after_train()
         if self.writer is not None and comm.is_main_process():
             self.writer.close()
+        # Cleanly close the wandb run so its in-process buffers/state are flushed
+        # and released at end of training (no finish() was called previously).
+        cfg = getattr(self, "cfg", None)
+        if cfg is not None and getattr(cfg, "enable_wandb", False) and comm.is_main_process():
+            wandb.finish()
 
 
 @TRAINERS.register_module("DefaultTrainer")
@@ -301,19 +313,39 @@ class Trainer(TrainerBase):
         val_loader = None
         if self.cfg.evaluate:
             val_data = build_dataset(self.cfg.data.val)
+            subset_size = getattr(self.cfg, "val_subset_size", None)
+            if subset_size is not None:
+                n = min(subset_size, len(val_data))
+                val_data = torch.utils.data.Subset(val_data, range(n))
             if comm.get_world_size() > 1:
                 val_sampler = torch.utils.data.distributed.DistributedSampler(val_data)
             else:
                 val_sampler = None
-            val_loader = torch.utils.data.DataLoader(
-                val_data,
+            # Validation is bs=1 over full-resolution scenes (no SphereCrop). With the full
+            # train worker count the val loader pins num_workers * prefetch_factor large
+            # scenes in host RAM during every eval -- a ~25GB spike that OOM-kills mid-eval.
+            # Cap workers/prefetch and drop pin_memory (eval is not H2D-bound).
+            num_worker_val = getattr(self.cfg, "num_worker_val", None)
+            if num_worker_val is None:
+                num_worker_val = min(self.cfg.num_worker_per_gpu, 4)
+            loader_kwargs = dict(
                 batch_size=self.cfg.batch_size_val_per_gpu,
                 shuffle=False,
-                num_workers=self.cfg.num_worker_per_gpu,
-                pin_memory=True,
+                num_workers=num_worker_val,
+                pin_memory=False,
                 sampler=val_sampler,
                 collate_fn=collate_fn,
             )
+            if num_worker_val > 0:
+                loader_kwargs["prefetch_factor"] = 2
+                # Keep the (capped, pin_memory=False) val workers alive across evals.
+                # With eval_step_interval the loader is re-iterated ~hundreds of times;
+                # persistent workers remove that many spawn/teardown cycles (IPC churn /
+                # fragility) at the cost of a small fixed resident baseline. The eval-time
+                # peak is unchanged (still num_workers * prefetch_factor), so this does not
+                # regress the original val-loader OOM driver.
+                loader_kwargs["persistent_workers"] = True
+            val_loader = torch.utils.data.DataLoader(val_data, **loader_kwargs)
         return val_loader
 
     def build_optimizer(self):

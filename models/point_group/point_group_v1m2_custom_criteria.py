@@ -125,7 +125,7 @@ class PointGroup(nn.Module):
             )
 
             if mask.sum() == 0:
-                proposals_idx = torch.zeros(0).int()
+                proposals_idx = torch.zeros((0, 2)).int()
                 proposals_offset = torch.zeros(1).int()
             else:
                 center_pred_ = center_pred[mask]
