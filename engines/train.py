@@ -184,6 +184,43 @@ class Trainer(TrainerBase):
             # => after train
             self.after_train()
 
+    @staticmethod
+    def _split_input_dict(input_dict, accum):
+        """Split a collated batch into `accum` scene-contiguous micro-batches for
+        gradient accumulation. Returns a list of (sub_input_dict, weight) where the
+        weights sum to 1 (weight = #scenes in the micro-batch / total #scenes), so
+        summing the per-micro-batch (scene-mean) losses reproduces the full-batch
+        scene-mean. Per-point tensors (first dim == total points) are sliced to the
+        micro-batch's point range, `offset` is rebased, everything else is passed
+        through. With accum <= 1 (the default) this returns the batch unchanged with
+        weight 1.0, so the single-step path is bit-identical to before."""
+        offset = input_dict.get("offset", None)
+        if offset is None or accum is None or accum <= 1:
+            return [(input_dict, 1.0)]
+        n_scenes = int(offset.shape[0])
+        n_groups = min(int(accum), n_scenes)
+        if n_groups <= 1:
+            return [(input_dict, 1.0)]
+        total_pts = int(offset[-1])
+        base, rem = divmod(n_scenes, n_groups)
+        micro_batches, start_scene = [], 0
+        for i in range(n_groups):
+            size = base + (1 if i < rem else 0)
+            a, b = start_scene, start_scene + size - 1  # inclusive scene range
+            start_scene += size
+            p0 = 0 if a == 0 else int(offset[a - 1])
+            p1 = int(offset[b])
+            sub = {}
+            for key, val in input_dict.items():
+                if key == "offset":
+                    sub[key] = offset[a : b + 1] - p0
+                elif torch.is_tensor(val) and val.dim() >= 1 and val.shape[0] == total_pts:
+                    sub[key] = val[p0:p1]
+                else:
+                    sub[key] = val
+            micro_batches.append((sub, size / n_scenes))
+        return micro_batches
+
     def run_step(self):
         if version.parse(torch.__version__) >= version.parse("2.4"):
             auto_cast = partial(torch.amp.autocast, device_type="cuda")
@@ -196,14 +233,32 @@ class Trainer(TrainerBase):
             if isinstance(input_dict[key], torch.Tensor):
                 input_dict[key] = input_dict[key].cuda(non_blocking=True)
 
-        with auto_cast(
-            enabled=self.cfg.enable_amp, dtype=AMP_DTYPE[self.cfg.amp_dtype]
-        ):
-            output_dict = self.model(input_dict)
-            loss = output_dict["loss"]
+        # Gradient accumulation: split the batch into scene-contiguous micro-batches,
+        # backward each (loss scaled by its scene fraction), and take ONE optimizer +
+        # scheduler step per loader iteration. This keeps peak memory to a single
+        # micro-batch while preserving the effective batch size and the scheduler's
+        # step count (total_steps = iters/epoch * epochs is unchanged). accum=1 (the
+        # default for every existing config) reduces to the original single-forward path.
+        accum = getattr(self.cfg, "gradient_accumulation_steps", 1)
+        micro_batches = self._split_input_dict(input_dict, accum)
+
         self.optimizer.zero_grad()
+        log_dict = {}
+        for sub_dict, weight in micro_batches:
+            with auto_cast(
+                enabled=self.cfg.enable_amp, dtype=AMP_DTYPE[self.cfg.amp_dtype]
+            ):
+                output_dict = self.model(sub_dict)
+                loss = output_dict["loss"] * weight
+            if self.cfg.enable_amp:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            for key, val in output_dict.items():
+                if torch.is_tensor(val) and val.dim() == 0:
+                    log_dict[key] = log_dict.get(key, 0.0) + val.detach() * weight
+
         if self.cfg.enable_amp:
-            self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             if self.cfg.clip_grad is not None:
                 torch.nn.utils.clip_grad_norm_(
@@ -218,7 +273,6 @@ class Trainer(TrainerBase):
             if scaler <= self.scaler.get_scale():
                 self.scheduler.step()
         else:
-            loss.backward()
             if self.cfg.clip_grad is not None:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), self.cfg.clip_grad
@@ -227,7 +281,7 @@ class Trainer(TrainerBase):
             self.scheduler.step()
         if self.cfg.empty_cache:
             torch.cuda.empty_cache()
-        self.comm_info["model_output_dict"] = output_dict
+        self.comm_info["model_output_dict"] = log_dict
 
     def after_epoch(self):
         for h in self.hooks:

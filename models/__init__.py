@@ -7,3 +7,4 @@ from .litept import *
 
 # Instance Segmentation
 from .point_group import *
+from .mask_query import *

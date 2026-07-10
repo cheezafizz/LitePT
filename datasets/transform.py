@@ -375,6 +375,72 @@ class ClipGaussianJitter(object):
 
 
 @TRANSFORMS.register_module()
+class NormalJitter(object):
+    """Perturb per-point unit normals to mimic noisy reconstructed geometry.
+
+    Training normals are clean (PCA on dense synthetic geometry); at inference on
+    VGGT-reconstructed clouds the same PCA is run on noisier geometry, so normals
+    are locally noisier. This applies that domain shift at train time:
+        n' = normalize(n + clip(N(0, sigma), -clip, clip))
+    and, with per-point probability ``corrupt_ratio``, replaces a normal with a
+    random unit vector (models gross reconstruction errors). Calibrate ``sigma``
+    and ``corrupt_ratio`` with tools/analyze_normal_gap.py.
+    """
+
+    def __init__(self, sigma=0.1, clip=0.3, corrupt_ratio=0.0, p=1.0):
+        # sigma may be a scalar or a [lo, hi] range sampled per-scene (domain
+        # randomization: each scene draws its own noise level).
+        assert clip > 0
+        self.sigma = sigma
+        self.clip = clip
+        self.corrupt_ratio = corrupt_ratio
+        self.p = p
+
+    def __call__(self, data_dict):
+        if "normal" not in data_dict.keys() or random.random() > self.p:
+            return data_dict
+        normal = data_dict["normal"]
+        n = normal.shape[0]
+        sigma = (
+            np.random.uniform(self.sigma[0], self.sigma[1])
+            if isinstance(self.sigma, (list, tuple))
+            else self.sigma
+        )
+        jitter = np.clip(sigma * np.random.randn(n, 3), -self.clip, self.clip)
+        normal = normal + jitter
+        if self.corrupt_ratio > 0:
+            mask = np.random.rand(n) < self.corrupt_ratio
+            if mask.any():
+                normal[mask] = np.random.randn(int(mask.sum()), 3)
+        norm = np.linalg.norm(normal, axis=1, keepdims=True)
+        norm[norm < 1e-12] = 1.0
+        data_dict["normal"] = (normal / norm).astype(np.float32)
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class NormalDropout(object):
+    """Modality dropout for the normal feature.
+
+    With probability ``dropout_application_ratio`` the entire per-point normal
+    array is zeroed for the scene, forcing the model to segment from color +
+    geometry alone. This makes inference robust when reconstructed normals are
+    unusable. Mirrors RandomDropout's gating idiom.
+    """
+
+    def __init__(self, dropout_application_ratio=0.1):
+        self.dropout_application_ratio = dropout_application_ratio
+
+    def __call__(self, data_dict):
+        if (
+            "normal" in data_dict.keys()
+            and random.random() < self.dropout_application_ratio
+        ):
+            data_dict["normal"] = np.zeros_like(data_dict["normal"])
+        return data_dict
+
+
+@TRANSFORMS.register_module()
 class ChromaticAutoContrast(object):
     def __init__(self, p=0.2, blend_factor=None):
         self.p = p
