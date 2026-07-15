@@ -9,8 +9,22 @@ OPTIMIZERS.register_module(module=torch.optim.SGD, name="SGD")
 OPTIMIZERS.register_module(module=torch.optim.Adam, name="Adam")
 OPTIMIZERS.register_module(module=torch.optim.AdamW, name="AdamW")
 
+from utils.muon import MuonAdamW
+
+OPTIMIZERS.register_module(module=MuonAdamW, name="MuonAdamW")
+
 
 def build_optimizer(cfg, model, param_dicts=None):
+    if cfg.type == "MuonAdamW":
+        # MuonAdamW splits params into Muon (2D matrices) / AdamW (rest) groups
+        # internally, which needs parameter NAMES (to exempt nn.Embedding weights).
+        # It supersedes the keyword-based param_dicts split (pass param_dicts=None).
+        cfg.params = [
+            (n, p)
+            for n, p in model.named_parameters()
+            if p.requires_grad and "teacher" not in n
+        ]
+        return OPTIMIZERS.build(cfg=cfg)
     if param_dicts is None:
         # cfg.params = model.parameters()
         cfg.params = [

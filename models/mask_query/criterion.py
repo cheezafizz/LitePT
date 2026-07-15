@@ -113,11 +113,21 @@ class SetCriterion(nn.Module):
         empty_weight[num_classes] = eos_coef
         self.register_buffer("empty_weight", empty_weight)
 
-    def forward(self, pred_logits, pred_masks, gt_labels, gt_masks):
+    def forward(self, pred_logits, pred_masks, gt_labels, gt_masks, token_ignore=None):
         """One scene, one decoder layer. Returns dict(loss_ce, loss_mask, loss_dice),
-        all scalar tensors on the prediction device."""
+        all scalar tensors on the prediction device.
+
+        token_ignore (Nc,) bool, optional: tokens dominated by object points with no
+        instance id (real-scene seg_id=-2). They are dropped from BOTH the matching
+        costs and the mask/dice losses — their instance membership is unknown, so
+        they must not count as background evidence against any query mask."""
         device = pred_logits.device
         k = pred_logits.shape[0]
+        if token_ignore is not None and bool(token_ignore.any()):
+            keep = ~token_ignore
+            if bool(keep.any()):
+                pred_masks = pred_masks[:, keep]
+                gt_masks = gt_masks[:, keep]
         row, col = self.matcher(pred_logits, pred_masks, gt_labels, gt_masks)
 
         target_classes = torch.full(

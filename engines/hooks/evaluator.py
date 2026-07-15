@@ -142,9 +142,19 @@ class SemSegEvaluator(HookBase):
 
 @HOOKS.register_module()
 class InsSegEvaluator(HookBase):
-    def __init__(self, segment_ignore_index=(-1,), instance_ignore_index=-1):
+    def __init__(
+        self,
+        segment_ignore_index=(-1,),
+        instance_ignore_index=-1,
+        group_pattern=None,
+    ):
         self.segment_ignore_index = segment_ignore_index
         self.instance_ignore_index = instance_ignore_index
+        # Optional regex with one capture group applied to each val scene name
+        # (e.g. r"^[^_]+_([^_]+)_" -> machine id "001"/"004" of real-ssl scenes).
+        # When set, mAP/AP50/AP25 are additionally computed and logged per group
+        # (val/mAP_<group>, ...) alongside the unchanged overall metrics.
+        self.group_pattern = re.compile(group_pattern) if group_pattern else None
 
         self.valid_class_names = None  # update in before train
         self.overlaps = np.append(np.arange(0.5, 0.95, 0.05), 0.25)
@@ -581,7 +591,16 @@ class InsSegEvaluator(HookBase):
 
             loss = output_dict["loss"]
             loss_keys = [
-                k for k in ("loss", "seg_loss", "bias_l1_loss", "bias_cosine_loss")
+                k
+                for k in (
+                    "loss",
+                    "seg_loss",
+                    "bias_l1_loss",
+                    "bias_cosine_loss",
+                    "embed_loss",
+                    "embed_var_loss",
+                    "embed_dist_loss",
+                )
                 if k in output_dict
             ]
 
@@ -612,7 +631,13 @@ class InsSegEvaluator(HookBase):
             gt_instances, pred_instance = self.associate_instances(
                 output_dict, segment, instance
             )
-            scenes.append(dict(gt=gt_instances, pred=pred_instance))
+            group = None
+            if self.group_pattern is not None and "name" in input_dict:
+                name = input_dict["name"]
+                name = name[0] if isinstance(name, (list, tuple)) else name
+                match = self.group_pattern.search(name)
+                group = match.group(1) if match else None
+            scenes.append(dict(gt=gt_instances, pred=pred_instance, group=group))
 
             for key in loss_keys:
                 self.trainer.storage.put_scalar(f"val_{key}", output_dict[key].item())
@@ -626,7 +651,14 @@ class InsSegEvaluator(HookBase):
         loss_avg = self.trainer.storage.history("val_loss").avg
         loss_component_avg = {
             key: self.trainer.storage.history(f"val_{key}").avg
-            for key in ("seg_loss", "bias_l1_loss", "bias_cosine_loss")
+            for key in (
+                "seg_loss",
+                "bias_l1_loss",
+                "bias_cosine_loss",
+                "embed_loss",
+                "embed_var_loss",
+                "embed_dist_loss",
+            )
             if f"val_{key}" in self.trainer.storage.histories()
         }
         comm.synchronize()
@@ -652,6 +684,45 @@ class InsSegEvaluator(HookBase):
             )
         current_epoch = self.trainer.epoch + 1
         if self.trainer.writer is not None:
+            # Per-group (e.g. per-machine 001/004) breakdown of the same metrics;
+            # overall val/* metrics above already cover all groups combined.
+            group_ap_scores = {}
+            if self.group_pattern is not None:
+                groups = sorted({s["group"] for s in scenes if s["group"] is not None})
+                for g in groups:
+                    sub = [s for s in scenes if s["group"] == g]
+                    group_ap_scores[g] = (self.evaluate_matches(sub), len(sub))
+                for g, (scores, count) in group_ap_scores.items():
+                    self.trainer.logger.info(
+                        "Val group {g} ({n} scenes): mAP/AP50/AP25 "
+                        "{ap:.4f}/{ap50:.4f}/{ap25:.4f}.".format(
+                            g=g,
+                            n=count,
+                            ap=scores["all_ap"],
+                            ap50=scores["all_ap_50%"],
+                            ap25=scores["all_ap_25%"],
+                        )
+                    )
+                    self.trainer.writer.add_scalar(
+                        f"val/mAP_{g}", scores["all_ap"], current_epoch
+                    )
+                    self.trainer.writer.add_scalar(
+                        f"val/AP50_{g}", scores["all_ap_50%"], current_epoch
+                    )
+                    self.trainer.writer.add_scalar(
+                        f"val/AP25_{g}", scores["all_ap_25%"], current_epoch
+                    )
+                    if "object" in scores["classes"]:
+                        obj = scores["classes"]["object"]
+                        self.trainer.writer.add_scalar(
+                            f"val/mAP_object_{g}", obj["ap"], current_epoch
+                        )
+                        self.trainer.writer.add_scalar(
+                            f"val/AP50_object_{g}", obj["ap50%"], current_epoch
+                        )
+                        self.trainer.writer.add_scalar(
+                            f"val/AP25_object_{g}", obj["ap25%"], current_epoch
+                        )
             self.trainer.writer.add_scalar("val/loss", loss_avg, current_epoch)
             for key, value in loss_component_avg.items():
                 self.trainer.writer.add_scalar(f"val/{key}", value, current_epoch)
@@ -690,6 +761,15 @@ class InsSegEvaluator(HookBase):
                     log_dict[f"val/AP_{label_name}"] = cls["ap"]
                     log_dict[f"val/AP50_{label_name}"] = cls["ap50%"]
                     log_dict[f"val/AP25_{label_name}"] = cls["ap25%"]
+                for g, (scores, _) in group_ap_scores.items():
+                    log_dict[f"val/mAP_{g}"] = scores["all_ap"]
+                    log_dict[f"val/AP50_{g}"] = scores["all_ap_50%"]
+                    log_dict[f"val/AP25_{g}"] = scores["all_ap_25%"]
+                    if "object" in scores["classes"]:
+                        obj = scores["classes"]["object"]
+                        log_dict[f"val/mAP_object_{g}"] = obj["ap"]
+                        log_dict[f"val/AP50_object_{g}"] = obj["ap50%"]
+                        log_dict[f"val/AP25_object_{g}"] = obj["ap25%"]
                 wandb.log(log_dict)
         self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
         self.trainer.comm_info["current_metric_value"] = all_ap_50  # save for saver

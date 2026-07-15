@@ -183,6 +183,40 @@ class CheckpointSaver(HookBase):
         self.save_freq = save_freq  # None or int, None indicate only save model last
 
     def after_epoch(self):
+        self._save()
+        if is_main_process():
+            filename = os.path.join(
+                self.trainer.cfg.save_path, "model", "model_last.pth"
+            )
+            if self.save_freq and (self.trainer.epoch + 1) % self.save_freq == 0:
+                shutil.copyfile(
+                    filename,
+                    os.path.join(
+                        self.trainer.cfg.save_path,
+                        "model",
+                        f"epoch_{self.trainer.epoch + 1}.pth",
+                    ),
+                )
+
+    def after_step(self):
+        # With step-interval evaluation a mid-epoch death would otherwise lose up
+        # to a whole epoch of work, and best-tracking would only consider the last
+        # eval of each epoch. Save (and update best) right after each step eval —
+        # InsSegEvaluator runs earlier in the hook list, so comm_info already
+        # holds this eval's metric.
+        eval_step_interval = getattr(self.trainer.cfg, "eval_step_interval", None)
+        if not self.trainer.cfg.evaluate or eval_step_interval is None:
+            return
+        global_step = (
+            self.trainer.epoch * len(self.trainer.train_loader)
+            + self.trainer.comm_info["iter"]
+            + 1
+        )
+        if global_step % eval_step_interval != 0:
+            return
+        self._save()
+
+    def _save(self):
         if is_main_process():
             is_best = False
             if self.trainer.cfg.evaluate:
@@ -232,15 +266,6 @@ class CheckpointSaver(HookBase):
                 shutil.copyfile(
                     filename,
                     os.path.join(self.trainer.cfg.save_path, "model", "model_best.pth"),
-                )
-            if self.save_freq and (self.trainer.epoch + 1) % self.save_freq == 0:
-                shutil.copyfile(
-                    filename,
-                    os.path.join(
-                        self.trainer.cfg.save_path,
-                        "model",
-                        f"epoch_{self.trainer.epoch + 1}.pth",
-                    ),
                 )
 
 

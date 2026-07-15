@@ -4,6 +4,7 @@ from .utils import point_collate_fn, collate_fn
 
 # indoor scene
 from .scannet import ScanNetDataset, ScanNet200Dataset
+from .real_ssl import RealSSLDataset
 from .structure3d import Structured3DDataset
 
 # outdoor scene

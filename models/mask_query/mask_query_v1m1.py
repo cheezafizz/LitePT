@@ -117,8 +117,20 @@ class MaskQuery(nn.Module):
         class_weight=None,
         criteria=None,
         freeze_backbone=False,
+        unknown_bg_index=None,
+        object_class_index=6,
+        not_object_loss_weight=1.0,
+        use_semantic_head=True,
     ):
         super().__init__()
+        # Real-scene partial labels (tools/convert_ssl_scenes.py): points labeled
+        # `unknown_bg_index` are known NOT to be `object_class_index` but their true
+        # class is unknown. They get a -log(1 - p_object) penalty and are remapped to
+        # `semantic_ignore_index` before the CE/Lovasz criteria. None disables the
+        # path entirely (synthetic-only training is byte-identical to before).
+        self.unknown_bg_index = unknown_bg_index
+        self.object_class_index = object_class_index
+        self.not_object_loss_weight = not_object_loss_weight
         self.semantic_num_classes = semantic_num_classes
         self.semantic_ignore_index = semantic_ignore_index
         self.segment_ignore_index = tuple(segment_ignore_index)
@@ -129,9 +141,13 @@ class MaskQuery(nn.Module):
         self.mask_threshold = mask_threshold
 
         self.backbone = build_model(backbone)
-        # auxiliary per-point semantic head (retained supervision)
-        self.seg_head = nn.Linear(backbone_out_channels, semantic_num_classes)
-        self.seg_criteria = build_criteria(criteria)
+        # auxiliary per-point semantic head (retained supervision). use_semantic_head=
+        # False drops the head entirely: no seg_head params, no CE/Lovasz seg_loss, and
+        # no unknown_bg not-object partial loss (both read seg_logits).
+        self.use_semantic_head = use_semantic_head
+        if self.use_semantic_head:
+            self.seg_head = nn.Linear(backbone_out_channels, semantic_num_classes)
+            self.seg_criteria = build_criteria(criteria)
 
         # project backbone features into the decoder / mask-embedding space
         self.input_proj = nn.Sequential(
@@ -246,10 +262,21 @@ class MaskQuery(nn.Module):
         """Build token-level GT for one scene. Returns gt_labels (G,) long and
         gt_masks (G, Nc) float. G = # of thing instances (class not in
         segment_ignore_index). Each token is assigned to the instance (or background)
-        that owns the majority of its points."""
+        that owns the majority of its points. Also returns token_ignore (Nc,) bool:
+        tokens majority-owned by instance-ignored OBJECT points (real-scene seg_id=-2,
+        object evidence the matcher left ungrouped) — these are excluded from the
+        mask/dice loss so they never act as negative (background) mask evidence."""
         device = instance_s.device
         valid = instance_s != self.instance_ignore_index
         uids = torch.unique(instance_s[valid]) if valid.any() else instance_s[:0]
+
+        ignore_pts = (~valid) & (segment_s == self.object_class_index)
+        if ignore_pts.any():
+            ign_cnt = torch.bincount(p2t[ignore_pts], minlength=nc)
+            tok_cnt = torch.bincount(p2t, minlength=nc)
+            token_ignore = ign_cnt * 2 > tok_cnt
+        else:
+            token_ignore = torch.zeros(nc, dtype=torch.bool, device=device)
 
         keep_uids, keep_labels = [], []
         for uid in uids.tolist():
@@ -265,6 +292,7 @@ class MaskQuery(nn.Module):
             return (
                 torch.zeros(0, dtype=torch.long, device=device),
                 torch.zeros(0, nc, device=device),
+                token_ignore,
             )
 
         # compact per-point label: index into keep_uids, or g (=background)
@@ -277,7 +305,7 @@ class MaskQuery(nn.Module):
         arange_g = torch.arange(g, device=device)
         gt_masks = (token_assign[None, :] == arange_g[:, None]).float()  # (G, Nc)
         gt_labels = torch.tensor(keep_labels, dtype=torch.long, device=device)
-        return gt_labels, gt_masks
+        return gt_labels, gt_masks, token_ignore
 
     # ---- inference (per scene) ----
     def _infer_scene(self, pred_last, p2t, start, end, n_total):
@@ -319,8 +347,40 @@ class MaskQuery(nn.Module):
         instance = data_dict["instance"]
 
         feat = self._backbone_feat(data_dict)  # (N, backbone_out_channels)
-        seg_logits = self.seg_head(feat)  # (N, C)
-        seg_loss = self.seg_criteria(seg_logits, segment)
+        if self.use_semantic_head:
+            seg_logits = self.seg_head(feat)  # (N, C)
+            not_object_loss = seg_logits.sum() * 0.0
+            if self.unknown_bg_index is not None:
+                unknown_bg = segment == self.unknown_bg_index
+                if unknown_bg.any():
+                    # -log(1 - p_object) on known-not-object points, from log-softmax
+                    # for stability; clamp keeps the loss finite when p_object
+                    # saturates.
+                    log_prob = F.log_softmax(seg_logits[unknown_bg].float(), dim=-1)
+                    p_obj = (
+                        log_prob[:, self.object_class_index].exp().clamp(max=1.0 - 1e-6)
+                    )
+                    not_object_loss = -torch.log1p(-p_obj).mean()
+                    segment = segment.clone()
+                    segment[unknown_bg] = self.semantic_ignore_index
+            if (segment != self.semantic_ignore_index).any():
+                seg_loss = self.seg_criteria(seg_logits, segment)
+            else:
+                # Real scenes with no detected objects have every point remapped to
+                # ignore above; CE/Lovasz cannot handle an all-ignored target.
+                seg_loss = seg_logits.sum() * 0.0
+        else:
+            # No semantic head: keep zero-valued loss keys so InformationWriter /
+            # wandb logging and the total-loss sum are shape-identical. unknown_bg
+            # points still need remapping so _build_scene_gt treats them as plain
+            # background rather than a distinct class.
+            seg_loss = feat.sum() * 0.0
+            not_object_loss = feat.sum() * 0.0
+            if self.unknown_bg_index is not None:
+                unknown_bg = segment == self.unknown_bg_index
+                if unknown_bg.any():
+                    segment = segment.clone()
+                    segment[unknown_bg] = self.semantic_ignore_index
         mask_feat = self.input_proj(feat)  # (N, d)
 
         n_total = feat.shape[0]
@@ -341,11 +401,11 @@ class MaskQuery(nn.Module):
             token_pos = self.pos_proj(self.pos_enc(self._norm_coord(token_coord)))
             preds = self._decode(tokens, token_pos)
 
-            gt_labels, gt_masks = self._build_scene_gt(
+            gt_labels, gt_masks, token_ignore = self._build_scene_gt(
                 instance_s, segment_s, p2t, tokens.shape[0]
             )
             for cls, msk in preds:
-                d = self.criterion(cls, msk, gt_labels, gt_masks)
+                d = self.criterion(cls, msk, gt_labels, gt_masks, token_ignore)
                 total["loss_ce"] = total["loss_ce"] + d["loss_ce"]
                 total["loss_mask"] = total["loss_mask"] + d["loss_mask"]
                 total["loss_dice"] = total["loss_dice"] + d["loss_dice"]
@@ -361,7 +421,13 @@ class MaskQuery(nn.Module):
         loss_ce = total["loss_ce"] / denom
         loss_mask = total["loss_mask"] / denom
         loss_dice = total["loss_dice"] / denom
-        loss = seg_loss + loss_ce + loss_mask + loss_dice
+        loss = (
+            seg_loss
+            + self.not_object_loss_weight * not_object_loss
+            + loss_ce
+            + loss_mask
+            + loss_dice
+        )
 
         return_dict = dict(
             loss=loss,
@@ -369,6 +435,7 @@ class MaskQuery(nn.Module):
             loss_mask=loss_mask,
             loss_dice=loss_dice,
             seg_loss=seg_loss,
+            loss_not_object=not_object_loss,
         )
 
         if not self.training:

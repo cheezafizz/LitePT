@@ -1884,10 +1884,13 @@ class InstanceParser(object):
         mask = ~np.isin(segment, self.segment_ignore_index)
         # mapping ignored instance to ignore index
         instance[~mask] = self.instance_ignore_index
-        # reorder left instance
-        unique, inverse = np.unique(instance[mask], return_inverse=True)
+        # reorder left instance; keep already-ignored instances (e.g. real-scene
+        # object points the matcher left ungrouped) OUT of the relabeling so the
+        # ignore index is never remapped to a valid instance id
+        valid = mask & (instance != self.instance_ignore_index)
+        unique, inverse = np.unique(instance[valid], return_inverse=True)
         instance_num = len(unique)
-        instance[mask] = inverse
+        instance[valid] = inverse
         # init instance information
         centroid = np.ones((coord.shape[0], 3)) * self.instance_ignore_index
         bbox = np.ones((instance_num, 8)) * self.instance_ignore_index

@@ -370,7 +370,11 @@ class Trainer(TrainerBase):
             subset_size = getattr(self.cfg, "val_subset_size", None)
             if subset_size is not None:
                 n = min(subset_size, len(val_data))
-                val_data = torch.utils.data.Subset(val_data, range(n))
+                # Evenly-spaced (not first-n) so the subset spans the whole sorted
+                # val split — first-n silently dropped every scene of later name
+                # prefixes (e.g. all machine-004 real-ssl scenes).
+                indices = torch.linspace(0, len(val_data) - 1, n).long().tolist()
+                val_data = torch.utils.data.Subset(val_data, indices)
             if comm.get_world_size() > 1:
                 val_sampler = torch.utils.data.distributed.DistributedSampler(val_data)
             else:
