@@ -71,7 +71,7 @@ Append-only decision ledger for repo hygiene / environment cleanup.
 
 ## #006 — Add a repo `CLAUDE.md` with environment non-negotiables
 - Date: 2026-07-22
-- Status: proposed
+- Status: done
 - Context: Critical operational facts exist only in private session memory: must use
   `/home/fai/miniconda3/envs/litept/bin/python`; long trainings need `setsid nohup`
   (CC background tasks die on session exit); eval must be fp32 (spconv autotuner breaks
@@ -83,7 +83,7 @@ Append-only decision ledger for repo hygiene / environment cleanup.
 
 ## #007 — Sync `requirements.txt` with the locked env
 - Date: 2026-07-22
-- Status: proposed
+- Status: done
 - Context: `scripts/setup_litept_env.sh` + `scripts/requirements-litept-lock.txt` are the real
   env definition; root `requirements.txt` is unpinned/stale and misleads anyone who finds it first.
 - Decision: Add a header comment to `requirements.txt` pointing to the installer + lockfile

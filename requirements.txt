@@ -1,3 +1,5 @@
+# NOTE: canonical env = scripts/setup_litept_env.sh + scripts/requirements-litept-lock.txt
+# This file is an unpinned convenience list only. See CLAUDE.md.
 h5py 
 pyyaml
 sharedarray
