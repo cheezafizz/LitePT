@@ -108,3 +108,15 @@ Append-only decision ledger for repo hygiene / environment cleanup.
   source code lives there (whole dir was untracked).
 - Decision: Add `viz/` to `.gitignore`. Viewer/plotting *code* lives in `tools/` and is tracked.
 - Consequences: If a viz subdir ever needs sharing, copy it out or negate the rule for that path.
+
+## #010 — `.omc/` stays ignored; durable outputs get promoted to `docs/`
+- Date: 2026-07-22
+- Status: done
+- Context: `.omc/` is OMC session state (sessions/, state/, logs/ — ephemeral), but it can
+  trap durable content: `.omc/progress.txt` held the full val-OOM crash investigation.
+  Stray `data/.omc` + `data/.claude` (from sessions launched with cwd=data/) were moved to
+  `scratch/stray-session-state/` (reversible) rather than deleted.
+- Decision: Keep `.omc/` (and any future `.omc/plans|research`) ignored. Anything worth
+  keeping is PROMOTED: copied into `docs/` and committed (e.g. `docs/oom-eval-diagnosis.md`).
+  Research-result promotion flow will be governed by the upcoming `docs/research-plan-adr.md`.
+- Consequences: No agent-state noise in git; investigation records survive in the repo.
