@@ -113,6 +113,10 @@ class MaskQuery(nn.Module):
         loss_class_weight=2.0,
         loss_mask_weight=5.0,
         loss_dice_weight=5.0,
+        loss_overlap_weight=0.0,
+        use_boundary_weight=False,
+        boundary_weight=5.0,
+        boundary_radius=1,
         eos_coef=0.1,
         class_weight=None,
         criteria=None,
@@ -139,6 +143,14 @@ class MaskQuery(nn.Module):
         self.dec_dim = dec_dim
         self.context_grid_factor = context_grid_factor
         self.mask_threshold = mask_threshold
+        # anti-merge loss knobs (default off -> byte-identical to prior configs):
+        #   loss_overlap_weight > 0  -> pairwise query repulsion (Method 1)
+        #   use_boundary_weight      -> boundary-weighted mask BCE (Method 2),
+        #     up-weighting tokens within `boundary_radius` coarse cells of a token
+        #     owned by a DIFFERENT GT instance by `boundary_weight`.
+        self.use_boundary_weight = use_boundary_weight
+        self.boundary_weight = boundary_weight
+        self.boundary_radius = boundary_radius
 
         self.backbone = build_model(backbone)
         # auxiliary per-point semantic head (retained supervision). use_semantic_head=
@@ -177,6 +189,7 @@ class MaskQuery(nn.Module):
             loss_class_weight=loss_class_weight,
             loss_mask_weight=loss_mask_weight,
             loss_dice_weight=loss_dice_weight,
+            loss_overlap_weight=loss_overlap_weight,
             eos_coef=eos_coef,
             class_weight=class_weight,
         )
@@ -207,17 +220,18 @@ class MaskQuery(nn.Module):
     def _tokenize(self, feat_s, grid_coord_s, coord_s):
         """Grid-pool per-scene point features to coarse context tokens.
 
-        Returns tokens (Nc, d), token coords (Nc, 3), and a point->token index map
-        p2t (n,). Coarse cell = grid_coord // context_grid_factor (e.g. 5 * 2 mm = 1 cm).
+        Returns tokens (Nc, d), token coords (Nc, 3), integer coarse-grid coords
+        token_grid_coord (Nc, 3), and a point->token index map p2t (n,). Coarse cell =
+        grid_coord // context_grid_factor (e.g. 5 * 2 mm = 1 cm).
         """
         coarse = torch.div(
             grid_coord_s, self.context_grid_factor, rounding_mode="floor"
         )
-        _, p2t = torch.unique(coarse, dim=0, return_inverse=True)
+        token_grid_coord, p2t = torch.unique(coarse, dim=0, return_inverse=True)
         nc = int(p2t.max().item()) + 1
         tokens = torch_scatter.scatter_mean(feat_s, p2t, dim=0, dim_size=nc)
         token_coord = torch_scatter.scatter_mean(coord_s, p2t, dim=0, dim_size=nc)
-        return tokens, token_coord, p2t
+        return tokens, token_coord, token_grid_coord, p2t
 
     @staticmethod
     def _norm_coord(coord):
@@ -258,14 +272,17 @@ class MaskQuery(nn.Module):
         return preds
 
     # ---- ground-truth token construction (per scene) ----
-    def _build_scene_gt(self, instance_s, segment_s, p2t, nc):
+    def _build_scene_gt(self, instance_s, segment_s, p2t, nc, token_grid_coord=None):
         """Build token-level GT for one scene. Returns gt_labels (G,) long and
         gt_masks (G, Nc) float. G = # of thing instances (class not in
         segment_ignore_index). Each token is assigned to the instance (or background)
         that owns the majority of its points. Also returns token_ignore (Nc,) bool:
         tokens majority-owned by instance-ignored OBJECT points (real-scene seg_id=-2,
         object evidence the matcher left ungrouped) — these are excluded from the
-        mask/dice loss so they never act as negative (background) mask evidence."""
+        mask/dice loss so they never act as negative (background) mask evidence.
+
+        Fourth return is token_weight (Nc,) float, the per-token mask-BCE multiplier
+        (all ones unless boundary weighting is enabled; see _boundary_token_weight)."""
         device = instance_s.device
         valid = instance_s != self.instance_ignore_index
         uids = torch.unique(instance_s[valid]) if valid.any() else instance_s[:0]
@@ -293,6 +310,7 @@ class MaskQuery(nn.Module):
                 torch.zeros(0, dtype=torch.long, device=device),
                 torch.zeros(0, nc, device=device),
                 token_ignore,
+                torch.ones(nc, device=device),
             )
 
         # compact per-point label: index into keep_uids, or g (=background)
@@ -301,11 +319,57 @@ class MaskQuery(nn.Module):
             lbl[instance_s == uid] = gi
         flat = p2t * (g + 1) + lbl
         counts = torch.bincount(flat, minlength=nc * (g + 1)).view(nc, g + 1)
-        token_assign = counts.argmax(dim=1)  # (Nc,)
+        token_assign = counts.argmax(dim=1)  # (Nc,) values in [0, g], g == background
         arange_g = torch.arange(g, device=device)
         gt_masks = (token_assign[None, :] == arange_g[:, None]).float()  # (G, Nc)
         gt_labels = torch.tensor(keep_labels, dtype=torch.long, device=device)
-        return gt_labels, gt_masks, token_ignore
+        token_weight = self._boundary_token_weight(token_assign, g, token_grid_coord, nc)
+        return gt_labels, gt_masks, token_ignore, token_weight
+
+    def _boundary_token_weight(self, token_assign, g, token_grid_coord, nc):
+        """Per-token mask-BCE multiplier (Nc,). All ones unless boundary weighting is
+        on, in which case tokens within `boundary_radius` coarse cells of a token owned
+        by a DIFFERENT real GT instance (foreground<->foreground boundary) are set to
+        `boundary_weight`. Computed once per scene on the integer coarse grid via a
+        sorted-key neighbour lookup. token_assign (Nc,) in [0, g] with g == background;
+        token_grid_coord (Nc, 3) integer coarse-cell coords."""
+        device = token_assign.device
+        weight = torch.ones(nc, device=device)
+        if not self.use_boundary_weight or token_grid_coord is None or g < 2:
+            return weight
+
+        fg = token_assign < g  # foreground tokens (assigned to a real instance)
+        coord = token_grid_coord.long()
+        coord = coord - coord.min(dim=0)[0]  # shift to >= 0, order preserved
+        span = coord.max(dim=0)[0] + 1  # per-axis extent
+        sx = int(span[1].item()) * int(span[2].item())
+        sy = int(span[2].item())
+        # monotone bijective pack of in-range coords -> 1-D key
+        key = coord[:, 0] * sx + coord[:, 1] * sy + coord[:, 2]  # (Nc,)
+        order = torch.argsort(key)
+        key_sorted = key[order]
+        assign_sorted = token_assign[order]
+
+        r = self.boundary_radius
+        boundary = torch.zeros(nc, dtype=torch.bool, device=device)
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                for dz in range(-r, r + 1):
+                    if dx == 0 and dy == 0 and dz == 0:
+                        continue
+                    nx, ny, nz = coord[:, 0] + dx, coord[:, 1] + dy, coord[:, 2] + dz
+                    in_range = (
+                        (nx >= 0) & (nx < span[0])
+                        & (ny >= 0) & (ny < span[1])
+                        & (nz >= 0) & (nz < span[2])
+                    )
+                    nkey = nx * sx + ny * sy + nz
+                    idx = torch.searchsorted(key_sorted, nkey).clamp(max=nc - 1)
+                    hit = in_range & (key_sorted[idx] == nkey)  # neighbour exists
+                    na = assign_sorted[idx]  # neighbour's assignment
+                    boundary |= hit & fg & (na < g) & (na != token_assign)
+        weight[boundary] = self.boundary_weight
+        return weight
 
     # ---- inference (per scene) ----
     def _infer_scene(self, pred_last, p2t, start, end, n_total):
@@ -384,7 +448,7 @@ class MaskQuery(nn.Module):
         mask_feat = self.input_proj(feat)  # (N, d)
 
         n_total = feat.shape[0]
-        total = dict(loss_ce=0.0, loss_mask=0.0, loss_dice=0.0)
+        total = dict(loss_ce=0.0, loss_mask=0.0, loss_dice=0.0, loss_overlap=0.0)
         n_scenes = 0
         all_masks, all_scores, all_classes = [], [], []
 
@@ -397,18 +461,22 @@ class MaskQuery(nn.Module):
             instance_s = instance[start:end]
             segment_s = segment[start:end]
 
-            tokens, token_coord, p2t = self._tokenize(feat_s, grid_coord_s, coord_s)
+            tokens, token_coord, token_grid_coord, p2t = self._tokenize(
+                feat_s, grid_coord_s, coord_s
+            )
             token_pos = self.pos_proj(self.pos_enc(self._norm_coord(token_coord)))
             preds = self._decode(tokens, token_pos)
 
-            gt_labels, gt_masks, token_ignore = self._build_scene_gt(
-                instance_s, segment_s, p2t, tokens.shape[0]
+            gt_labels, gt_masks, token_ignore, token_weight = self._build_scene_gt(
+                instance_s, segment_s, p2t, tokens.shape[0], token_grid_coord
             )
+            tw = token_weight if self.use_boundary_weight else None
             for cls, msk in preds:
-                d = self.criterion(cls, msk, gt_labels, gt_masks, token_ignore)
+                d = self.criterion(cls, msk, gt_labels, gt_masks, token_ignore, tw)
                 total["loss_ce"] = total["loss_ce"] + d["loss_ce"]
                 total["loss_mask"] = total["loss_mask"] + d["loss_mask"]
                 total["loss_dice"] = total["loss_dice"] + d["loss_dice"]
+                total["loss_overlap"] = total["loss_overlap"] + d["loss_overlap"]
             n_scenes += 1
 
             if not self.training:
@@ -421,12 +489,14 @@ class MaskQuery(nn.Module):
         loss_ce = total["loss_ce"] / denom
         loss_mask = total["loss_mask"] / denom
         loss_dice = total["loss_dice"] / denom
+        loss_overlap = total["loss_overlap"] / denom
         loss = (
             seg_loss
             + self.not_object_loss_weight * not_object_loss
             + loss_ce
             + loss_mask
             + loss_dice
+            + loss_overlap
         )
 
         return_dict = dict(
@@ -434,6 +504,7 @@ class MaskQuery(nn.Module):
             loss_ce=loss_ce,
             loss_mask=loss_mask,
             loss_dice=loss_dice,
+            loss_overlap=loss_overlap,
             seg_loss=seg_loss,
             loss_not_object=not_object_loss,
         )

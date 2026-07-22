@@ -96,6 +96,7 @@ class SetCriterion(nn.Module):
         loss_class_weight=2.0,
         loss_mask_weight=5.0,
         loss_dice_weight=5.0,
+        loss_overlap_weight=0.0,
         eos_coef=0.1,
         class_weight=None,
     ):
@@ -105,6 +106,11 @@ class SetCriterion(nn.Module):
         self.loss_class_weight = loss_class_weight
         self.loss_mask_weight = loss_mask_weight
         self.loss_dice_weight = loss_dice_weight
+        # loss_overlap_weight > 0 enables an explicit pairwise repulsion between the
+        # matched-query masks (sum_{i!=j} sigma(m_i)*sigma(m_j) per token). It targets
+        # the near-GT-merge case a thin "bridge" of tokens shared by two adjacent
+        # instances costs almost nothing under the token-averaged BCE. 0.0 = disabled.
+        self.loss_overlap_weight = loss_overlap_weight
         # empty_weight: (C+1,) CE weights; real classes get `class_weight` (or 1),
         # the no-object slot gets `eos_coef`.
         empty_weight = torch.ones(num_classes + 1)
@@ -113,14 +119,28 @@ class SetCriterion(nn.Module):
         empty_weight[num_classes] = eos_coef
         self.register_buffer("empty_weight", empty_weight)
 
-    def forward(self, pred_logits, pred_masks, gt_labels, gt_masks, token_ignore=None):
-        """One scene, one decoder layer. Returns dict(loss_ce, loss_mask, loss_dice),
-        all scalar tensors on the prediction device.
+    def forward(
+        self,
+        pred_logits,
+        pred_masks,
+        gt_labels,
+        gt_masks,
+        token_ignore=None,
+        token_weight=None,
+    ):
+        """One scene, one decoder layer. Returns
+        dict(loss_ce, loss_mask, loss_dice, loss_overlap), all scalar tensors on the
+        prediction device.
 
         token_ignore (Nc,) bool, optional: tokens dominated by object points with no
         instance id (real-scene seg_id=-2). They are dropped from BOTH the matching
         costs and the mask/dice losses — their instance membership is unknown, so
-        they must not count as background evidence against any query mask."""
+        they must not count as background evidence against any query mask.
+
+        token_weight (Nc,) float, optional: per-token multiplier for the mask BCE,
+        used to up-weight tokens on a GT instance<->instance boundary (boundary-
+        weighted / hard-token BCE). Sliced with the same `keep` mask as the masks so
+        it stays aligned; None (or all-ones) reproduces the plain token-averaged BCE."""
         device = pred_logits.device
         k = pred_logits.shape[0]
         if token_ignore is not None and bool(token_ignore.any()):
@@ -128,6 +148,8 @@ class SetCriterion(nn.Module):
             if bool(keep.any()):
                 pred_masks = pred_masks[:, keep]
                 gt_masks = gt_masks[:, keep]
+                if token_weight is not None:
+                    token_weight = token_weight[keep]
         row, col = self.matcher(pred_logits, pred_masks, gt_labels, gt_masks)
 
         target_classes = torch.full(
@@ -142,14 +164,31 @@ class SetCriterion(nn.Module):
         if row.numel() > 0:
             src = pred_masks[row]  # (m, Nc)
             tgt = gt_masks[col]  # (m, Nc)
-            loss_mask = F.binary_cross_entropy_with_logits(src, tgt)
+            if token_weight is not None:
+                # boundary-weighted BCE: per-token multiplier, then mean over m*Nc
+                # (uniform weights reproduce F.binary_cross_entropy_with_logits mean).
+                bce = F.binary_cross_entropy_with_logits(src, tgt, reduction="none")
+                loss_mask = (bce * token_weight[None, :]).mean()
+            else:
+                loss_mask = F.binary_cross_entropy_with_logits(src, tgt)
             loss_dice = dice_loss(src, tgt)
+            if self.loss_overlap_weight > 0 and src.shape[0] > 1:
+                # pairwise repulsion: sum_{i!=j} p_i*p_j per token = colsum^2 - sq_sum.
+                # 0.5 counts each unordered query pair once; mean over tokens.
+                p = src.sigmoid()  # (m, Nc)
+                col_sum = p.sum(dim=0)  # (Nc,)
+                sq_sum = (p * p).sum(dim=0)  # (Nc,)
+                loss_overlap = 0.5 * (col_sum * col_sum - sq_sum).mean()
+            else:
+                loss_overlap = pred_masks.sum() * 0.0
         else:
             loss_mask = pred_masks.sum() * 0.0
             loss_dice = pred_masks.sum() * 0.0
+            loss_overlap = pred_masks.sum() * 0.0
 
         return dict(
             loss_ce=self.loss_class_weight * loss_ce,
             loss_mask=self.loss_mask_weight * loss_mask,
             loss_dice=self.loss_dice_weight * loss_dice,
+            loss_overlap=self.loss_overlap_weight * loss_overlap,
         )
