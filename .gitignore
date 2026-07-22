@@ -1,5 +1,28 @@
+# data & experiment outputs
 data
 exp
-*.json
+eval/
+logs/
+smoke_viz_v111/
+
+# agent/session state
+.omc/
+.claude/settings.local.json
+
+# build artifacts
+__pycache__/
 *.pyc
+libs/**/build/
+*.egg-info/
+*.o
+
+# local venvs
+.venv-viser
+
+# bulky generated assets
 *.glb
+*.npz
+*.log
+
+# scratch
+scratch/
