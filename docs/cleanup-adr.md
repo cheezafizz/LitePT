@@ -50,7 +50,7 @@ Append-only decision ledger for repo hygiene / environment cleanup.
 
 ## #004 — Track `docs/` content
 - Date: 2026-07-22
-- Status: proposed
+- Status: done
 - Context: `docs/` holds three substantive clustering write-ups
   (`clustering-embed-maskclust-strong-rag-sv.md`, `clustering_sv_svdom.md`,
   `insseg-litept-small-v1m2-2of3-embed.md`) that exist only on this machine.
