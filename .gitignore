@@ -26,3 +26,6 @@ libs/**/build/
 
 # scratch
 scratch/
+
+# generated visualization output
+viz/

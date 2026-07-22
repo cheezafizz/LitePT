@@ -100,3 +100,11 @@ Append-only decision ledger for repo hygiene / environment cleanup.
   resume/eval hooks.
 - Consequences: If done, #002's `eval/` ignore rule becomes vestigial but stays (append a
   superseding entry then).
+
+## #009 — Ignore `viz/` (generated visualization output)
+- Date: 2026-07-22
+- Status: done
+- Context: `viz/` holds 4.1GB of generated PNG/demo output across 19 experiment dirs; no
+  source code lives there (whole dir was untracked).
+- Decision: Add `viz/` to `.gitignore`. Viewer/plotting *code* lives in `tools/` and is tracked.
+- Consequences: If a viz subdir ever needs sharing, copy it out or negate the rule for that path.
