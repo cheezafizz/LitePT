@@ -93,6 +93,28 @@ def save_pointcloud_glb(path, coord, color_uint8, boxes=None, box_radius=0.01):
     trimesh.Scene(geometries).export(path)
 
 
+def assign_instance_ids(num_points, pred_masks, pred_scores):
+    """Winner-take-all instance id per point: the highest-scoring predicted
+    instance that contains it. Unassigned points get -1.
+
+    pred_masks: bool array (P, num_points)
+    pred_scores: float array (P,)
+    Returns: int32 array (num_points,) holding the proposal index, or -1.
+    """
+    inst_id = np.full(num_points, -1, dtype=np.int32)
+    if pred_masks.shape[0] == 0:
+        return inst_id
+    order = np.argsort(-np.asarray(pred_scores))
+    assigned = np.zeros(num_points, dtype=bool)
+    for proposal_idx in order:
+        mask = pred_masks[proposal_idx] & ~assigned
+        if not mask.any():
+            continue
+        inst_id[mask] = proposal_idx
+        assigned |= mask
+    return inst_id
+
+
 def colorize_predicted_instances(num_points, pred_masks, pred_scores):
     """Assign each point the color of the highest-scoring predicted instance
     that contains it; unassigned points stay gray.
@@ -103,15 +125,10 @@ def colorize_predicted_instances(num_points, pred_masks, pred_scores):
     out = np.tile(GRAY, (num_points, 1))
     if pred_masks.shape[0] == 0:
         return out
-    order = np.argsort(-np.asarray(pred_scores))
+    inst_id = assign_instance_ids(num_points, pred_masks, pred_scores)
     palette = instance_palette(pred_masks.shape[0])
-    assigned = np.zeros(num_points, dtype=bool)
-    for proposal_idx in order:
-        mask = pred_masks[proposal_idx] & ~assigned
-        if not mask.any():
-            continue
-        out[mask] = palette[proposal_idx]
-        assigned |= mask
+    assigned = inst_id >= 0
+    out[assigned] = palette[inst_id[assigned]]
     return out
 
 

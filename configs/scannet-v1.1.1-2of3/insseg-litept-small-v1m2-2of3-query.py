@@ -19,7 +19,7 @@ batch_size = 12 # bs: total (effective) bs in all gpus -- matches the base -2of3
 # micro-batch, effective batch preserved. Here 12 / 6 = 2 scenes/micro-batch -> ~14.6GB
 # peak (measured). NOTE this trainer uses "divide" semantics: effective batch == batch_size
 # (NOT batch_size * steps). (This knob was previously a no-op; engines/train.py now honors it.)
-gradient_accumulation_steps = 1
+gradient_accumulation_steps = 6
 num_worker = 12
 mix_prob = 0.8
 empty_cache = True
@@ -27,7 +27,7 @@ enable_amp = True
 amp_dtype = "bfloat16"
 evaluate = True
 enable_wandb = True
-wandb_log_interval = 50  # throttle per-step wandb logging on this ~847k-step run
+wandb_log_interval = 50  # throttle per-step wandb logging on this ~169k-step run
 wandb_project = "LitePT"  # wandb project name
 wandb_key = None # wandb token, default is None. If None, login with `wandb login` in your terminal
 
@@ -84,7 +84,13 @@ model = dict(
     segment_ignore_index=segment_ignore_index,
     instance_ignore_index=-1,
     # --- query decoder ---
-    num_queries=100,
+    # 50 queries (was 100): decoder cost (cross-attn K x Nc, mask logits, Hungarian
+    # matching) is ~linear in K and dominates (~75%) of step time at factor=1, so this
+    # is ~1.6x faster/step. K must cover the MIXED-sample instance count: mix_prob=0.8
+    # merges scene pairs at collate, so GT instances/sample go up to ~46 (single-scene
+    # max 23, p95 18, mean 10.9 over 500 train scenes). 25 was tried and rejected --
+    # ~1/3 of mixed samples would exceed it, leaving GTs Hungarian-unmatched.
+    num_queries=50,
     dec_dim=256,
     dec_layers=6,
     dec_num_head=8,
@@ -124,13 +130,17 @@ model = dict(
 )
 
 # scheduler settings
-epoch = 200
-eval_epoch = 200
-# train=50,803 scenes, bs=12 -> ~4,234 steps/epoch -> ~846,800 total steps.
-# eval every 5,000 steps -> ~169 evals (val split has 6,350 scenes, ~35x the s4
+# 40 epochs (was 200): the embed baseline hit its never-beaten best AP50 at epoch 21
+# of 200, so 40 epochs (~2x that) is the realistic convergence budget. OneCycleLR's
+# total_steps spans the configured epochs, so shrinking `epoch` (rather than stopping
+# a 200-epoch schedule early) lets the LR actually anneal within the run.
+epoch = 40
+eval_epoch = 40
+# train=50,803 scenes, bs=12 -> ~4,233 steps/epoch -> ~169,300 total steps.
+# eval every 1,000 steps -> ~169 evals (val split has 6,350 scenes, ~35x the s4
 # val set, so evaluating more often would dominate wall-clock).
 eval_step_interval = 1000
-val_subset_size = 500  # periodic eval uses only the first 500 val scenes (full val has 6,350)
+val_subset_size = 500  # periodic eval uses 500 evenly-spaced val scenes (full val has 6,350)
 optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
 scheduler = dict(
     type="OneCycleLR",

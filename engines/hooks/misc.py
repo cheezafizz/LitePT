@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import time
 import gc
+import csv
 import wandb
 import torch
 import torch.utils.data
@@ -498,13 +499,30 @@ class RuntimeProfiler_training(HookBase):
 
 @HOOKS.register_module()
 class RuntimeProfiler_inference(HookBase):
+    """Per-scene inference profiler.
+
+    Runs over the val loader (batch size 1 -> one scene per iteration) and reports,
+    for each requested precision, the per-scene distribution of forward+clustering
+    latency and (optionally) the full end-to-end breakdown (preprocess / H2D /
+    forward / back-projection), plus peak GPU VRAM and peak host RAM (RSS).
+    Runs in ``before_train`` and exits when ``interrupt=True`` so no training starts.
+    """
+
     def __init__(
         self,
         interrupt=True,
         warm_up=5,
+        precisions=("fp32",),
+        measure_end_to_end=False,
+        csv_path=None,
     ):
         self.interrupt = interrupt
         self.warm_up = warm_up
+        if isinstance(precisions, str):
+            precisions = (precisions,)
+        self.precisions = tuple(str(p).lower() for p in precisions)
+        self.measure_end_to_end = measure_end_to_end
+        self.csv_path = csv_path
 
     def nvidia_smi_mem(self, device_id=0):
         """Return memory.used (MB) for a specific GPU."""
@@ -512,70 +530,360 @@ class RuntimeProfiler_inference(HookBase):
         out = subprocess.check_output(cmd.split()).decode().strip()
         return int(out)
 
+    def _autocast_ctx(self, precision):
+        """Autocast context for the model forward under ``precision``."""
+        use_amp = precision != "fp32"
+        dtype = AMP_DTYPE["bfloat16"] if precision == "bf16" else AMP_DTYPE["float16"]
+        if version.parse(torch.__version__) >= version.parse("2.4"):
+            return torch.amp.autocast(device_type="cuda", enabled=use_amp, dtype=dtype)
+        if use_amp:
+            return torch.cuda.amp.autocast(dtype=dtype)
+        import contextlib
+
+        return contextlib.nullcontext()
+
+    @staticmethod
+    def _to_cuda(input_dict):
+        for key in input_dict.keys():
+            if isinstance(input_dict[key], torch.Tensor):
+                input_dict[key] = input_dict[key].cuda(non_blocking=True)
+
+    @staticmethod
+    def _stats(values):
+        if not values:
+            return dict(mean=0.0, median=0.0, p95=0.0, max=0.0, min=0.0)
+        s = sorted(values)
+        n = len(s)
+
+        def pct(p):
+            if n == 1:
+                return s[0]
+            k = (n - 1) * p
+            f = int(k)
+            c = min(f + 1, n - 1)
+            return s[f] + (s[c] - s[f]) * (k - f)
+
+        return dict(mean=sum(s) / n, median=pct(0.5), p95=pct(0.95), max=s[-1], min=s[0])
 
     def before_train(self):
-        self.trainer.logger.info("Profiling runtime ...")
+        self.trainer.logger.info("Profiling inference runtime ...")
+        loader = self.trainer.val_loader
+        if loader is None:
+            self.trainer.logger.info(
+                "No val_loader available (evaluate=False?); skipping inference profiling."
+            )
+            if self.interrupt:
+                sys.exit(0)
+            return
 
-        total_fwd_time = 0.0
-        num_batches = 0
+        try:
+            import psutil
+
+            proc = psutil.Process()
+        except Exception as exc:  # pragma: no cover - psutil expected to be present
+            self.trainer.logger.warning(f"psutil unavailable; host RAM not measured: {exc}")
+            proc = None
 
         self.trainer.model.eval()
+        device = torch.cuda.current_device()
 
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        # baseline driver memory
-        base_mem = self.nvidia_smi_mem(torch.cuda.current_device())
+        summaries = []
+        all_rows = []
+        failures = []
+        for precision in self.precisions:
+            try:
+                result = self._profile_precision(precision, loader, proc, device)
+                summaries.append(result["summary"])
+                all_rows.extend(result["rows"])
+            except Exception as exc:
+                import traceback as _tb
 
-        num_points = []
-        # optional warmup
-        print("\n Warming up...\n")
-        with torch.no_grad():
-            for i, input_dict in enumerate(self.trainer.val_loader):
-                if i >= self.warm_up:
-                    break
-                for key in input_dict.keys():
-                    if isinstance(input_dict[key], torch.Tensor):
-                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                msg = f"{type(exc).__name__}: {exc}"
+                self.trainer.logger.warning(
+                    f"Precision '{precision}' profiling failed and was skipped: {msg}"
+                )
+                print(f"\n[precision = {precision}] FAILED: {msg}\n{_tb.format_exc()}")
+                failures.append((precision, msg))
 
-                output_dict = self.trainer.model(input_dict)
+        self._report(summaries, failures)
+        if self.csv_path is not None:
+            self._write_csv(all_rows)
 
-
-        print("\n Measuring inference latency across dataset...\n")
-        with torch.no_grad():
-            for i, input_dict in enumerate(tqdm(self.trainer.val_loader)):
-                for key in input_dict.keys():
-                    if isinstance(input_dict[key], torch.Tensor):
-                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
-            
-                torch.cuda.synchronize()
-                fwd_start = time.perf_counter()
-
-                output_dict = self.trainer.model(input_dict)
-                
-                torch.cuda.synchronize()
-                fwd_end = time.perf_counter()
-                total_fwd_time += (fwd_end - fwd_start)
-
-                num_batches += 1
-
-
-        torch.cuda.synchronize()
-        alloc_MB = torch.cuda.max_memory_allocated() / 1024**3
-        resv_MB = torch.cuda.max_memory_reserved() / 1024**3
-        smi_MB = self.nvidia_smi_mem(torch.cuda.current_device())
-        delta_MB = smi_MB - base_mem
-
-        # ---- Final report ----
-        print("\n===== Runtime Profiling Results =====")
-        print(f"Average Inference time: {total_fwd_time/num_batches*1000:.3f} ms")
-        print(f"PyTorch max_memory_allocated : {alloc_MB:.2f} GB")
-        # max_memory_reserved is used for benchmarking memory in the paper
-        print(f"PyTorch max_memory_reserved  : {resv_MB:.2f} GB")
-        print(f"nvidia-smi memory.used       : {smi_MB/1024:.3f} GB")
-        print(f"Δ from baseline              : {delta_MB/1024:.3f} GB")
-        print("=====================================\n")
         if self.interrupt:
             sys.exit(0)
+
+    def _profile_precision(self, precision, loader, proc, device):
+        print(f"\n[Profiling precision = {precision}]")
+        torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.reset_peak_memory_stats()
+        base_smi = self.nvidia_smi_mem(device)
+        base_rss = proc.memory_info().rss if proc is not None else 0
+        peak_rss = base_rss
+        # Per-scene reset_peak_memory_stats() (below) clobbers the global peak, so
+        # track the run-level high-water marks ourselves to keep the run-level report.
+        run_peak_alloc_mb = 0.0
+        run_peak_reserved_mb = 0.0
+
+        pointops = None
+        if self.measure_end_to_end:
+            try:
+                import pointops as _pointops
+
+                pointops = _pointops
+            except Exception as exc:
+                self.trainer.logger.warning(
+                    f"pointops unavailable; back-projection time will be 0: {exc}"
+                )
+
+        # ---- warmup ----
+        print(f"  warming up ({self.warm_up}) ...")
+        with torch.no_grad():
+            for i, input_dict in enumerate(loader):
+                if i >= self.warm_up:
+                    break
+                self._to_cuda(input_dict)
+                with self._autocast_ctx(precision):
+                    self.trainer.model(input_dict)
+        torch.cuda.synchronize()
+
+        # ---- measure ----
+        print("  measuring ...")
+        rows = []
+        with torch.no_grad():
+            it = iter(loader)
+            idx = 0
+            pbar = tqdm(total=len(loader))
+            while True:
+                # ---- per-scene memory reset: capture this scene's peak in isolation ----
+                torch.cuda.reset_peak_memory_stats()
+                rss_start = proc.memory_info().rss if proc is not None else 0
+
+                # ---- load: CPU preprocessing (GridSample 2mm) + collate ----
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                try:
+                    input_dict = next(it)
+                except StopIteration:
+                    break
+                load_ms = (time.perf_counter() - t0) * 1000.0
+
+                if "offset" in input_dict:
+                    num_voxels = int(input_dict["offset"][-1])
+                else:
+                    num_voxels = int(input_dict["coord"].shape[0])
+                if "origin_coord" in input_dict:
+                    num_origin = int(input_dict["origin_coord"].shape[0])
+                else:
+                    num_origin = num_voxels
+                name = input_dict.get("name", None)
+                if isinstance(name, (list, tuple)):
+                    name = name[0] if len(name) else f"scene{idx}"
+                if not isinstance(name, str):
+                    name = f"scene{idx}"
+
+                # ---- H2D transfer ----
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                self._to_cuda(input_dict)
+                torch.cuda.synchronize()
+                h2d_ms = (time.perf_counter() - t0) * 1000.0
+
+                # ---- forward + clustering (GPU backbone + ballquery + CPU bfs) ----
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                with self._autocast_ctx(precision):
+                    output_dict = self.trainer.model(input_dict)
+                torch.cuda.synchronize()
+                fwd_ms = (time.perf_counter() - t0) * 1000.0
+
+                # ---- back-projection to full-resolution points ----
+                backproj_ms = 0.0
+                if (
+                    self.measure_end_to_end
+                    and pointops is not None
+                    and "origin_coord" in input_dict
+                    and "pred_masks" in output_dict
+                ):
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    bp_idx, _ = pointops.knn_query(
+                        1,
+                        input_dict["coord"].float(),
+                        input_dict["offset"].int(),
+                        input_dict["origin_coord"].float(),
+                        input_dict["origin_offset"].int(),
+                    )
+                    bp_idx = bp_idx.cpu().flatten().long()
+                    _ = output_dict["pred_masks"][:, bp_idx]
+                    torch.cuda.synchronize()
+                    backproj_ms = (time.perf_counter() - t0) * 1000.0
+
+                total_ms = load_ms + h2d_ms + fwd_ms + backproj_ms
+
+                # ---- per-scene peak memory (forward + clustering + back-projection) ----
+                # max_memory_allocated is the high-water since the reset at loop top, so
+                # it captures this scene's true activation peak. reserved is the caching
+                # allocator's pool (monotonic across the run; per-scene value is mostly the
+                # running high-water, kept for completeness).
+                gpu_alloc_mb = torch.cuda.max_memory_allocated() / 1024**2
+                gpu_reserved_mb = torch.cuda.max_memory_reserved() / 1024**2
+                run_peak_alloc_mb = max(run_peak_alloc_mb, gpu_alloc_mb)
+                run_peak_reserved_mb = max(run_peak_reserved_mb, gpu_reserved_mb)
+
+                if proc is not None:
+                    rss_now = proc.memory_info().rss
+                    peak_rss = max(peak_rss, rss_now)
+                    rss_mb = rss_now / 1024**2
+                    rss_delta_mb = (rss_now - rss_start) / 1024**2
+                else:
+                    rss_mb = 0.0
+                    rss_delta_mb = 0.0
+
+                rows.append(
+                    dict(
+                        precision=precision,
+                        name=name,
+                        num_voxels=num_voxels,
+                        num_origin_points=num_origin,
+                        load_ms=load_ms,
+                        h2d_ms=h2d_ms,
+                        fwd_ms=fwd_ms,
+                        backproj_ms=backproj_ms,
+                        total_ms=total_ms,
+                        gpu_alloc_mb=gpu_alloc_mb,
+                        gpu_reserved_mb=gpu_reserved_mb,
+                        rss_mb=rss_mb,
+                        rss_delta_mb=rss_delta_mb,
+                    )
+                )
+                idx += 1
+                pbar.update(1)
+            pbar.close()
+
+        torch.cuda.synchronize()
+        smi_now = self.nvidia_smi_mem(device)
+        n = max(len(rows), 1)
+        total_origin = sum(r["num_origin_points"] for r in rows)
+        total_fwd_s = sum(r["fwd_ms"] for r in rows) / 1000.0
+        summary = dict(
+            precision=precision,
+            n=len(rows),
+            gpu_alloc_gb=run_peak_alloc_mb / 1024,
+            gpu_reserved_gb=run_peak_reserved_mb / 1024,
+            gpu_smi_gb=smi_now / 1024,
+            gpu_smi_delta_gb=(smi_now - base_smi) / 1024,
+            rss_peak_gb=peak_rss / 1024**3,
+            rss_delta_gb=(peak_rss - base_rss) / 1024**3,
+            mean_voxels=sum(r["num_voxels"] for r in rows) / n,
+            mean_origin=total_origin / n,
+            throughput_pts_s=(total_origin / total_fwd_s) if total_fwd_s > 0 else 0.0,
+            fwd=self._stats([r["fwd_ms"] for r in rows]),
+            total=self._stats([r["total_ms"] for r in rows]),
+            load=self._stats([r["load_ms"] for r in rows]),
+            h2d=self._stats([r["h2d_ms"] for r in rows]),
+            backproj=self._stats([r["backproj_ms"] for r in rows]),
+            gpu_alloc=self._stats([r["gpu_alloc_mb"] for r in rows]),
+            gpu_reserved=self._stats([r["gpu_reserved_mb"] for r in rows]),
+            rss=self._stats([r["rss_mb"] for r in rows]),
+            rss_delta=self._stats([r["rss_delta_mb"] for r in rows]),
+        )
+        return dict(summary=summary, rows=rows)
+
+    def _report(self, summaries, failures=None):
+        lines = ["\n========== Inference Benchmark =========="]
+        cfg = self.trainer.cfg
+        lines.append(f"config save_path : {getattr(cfg, 'save_path', 'n/a')}")
+        lines.append(f"weight           : {getattr(cfg, 'weight', None)}")
+        try:
+            gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
+        except Exception:
+            gpu_name = "n/a"
+        lines.append(f"GPU              : {gpu_name}")
+        for precision, msg in failures or []:
+            lines.append(f"--- precision = {precision} | SKIPPED (unsupported): {msg} ---")
+        for s in summaries:
+            f = s["fwd"]
+            lines.append("")
+            lines.append(f"--- precision = {s['precision']} | scenes = {s['n']} ---")
+            lines.append(
+                f"  scene size       : {s['mean_voxels']:.0f} voxels/scene (input), "
+                f"{s['mean_origin']:.0f} origin pts/scene"
+            )
+            lines.append("  per-scene latency (ms)     mean / median /    p95 /    max")
+            lines.append(
+                f"    forward+cluster: {f['mean']:8.2f} / {f['median']:8.2f} / "
+                f"{f['p95']:8.2f} / {f['max']:8.2f}"
+            )
+            if self.measure_end_to_end:
+                t, l, h, b = s["total"], s["load"], s["h2d"], s["backproj"]
+                lines.append(
+                    f"    end-to-end     : {t['mean']:8.2f} / {t['median']:8.2f} / "
+                    f"{t['p95']:8.2f} / {t['max']:8.2f}"
+                )
+                lines.append(
+                    f"    breakdown(mean): preprocess {l['mean']:.2f} + H2D {h['mean']:.2f} "
+                    f"+ forward {f['mean']:.2f} + backproj {b['mean']:.2f} ms"
+                )
+            lines.append(
+                f"  throughput       : {s['throughput_pts_s'] / 1e6:.2f} M origin-pts/s (by forward time)"
+            )
+            ma, rs = s["gpu_alloc"], s["rss"]
+            lines.append("  per-scene GPU alloc (MB)   mean / median /    p95 /    max")
+            lines.append(
+                f"    activation peak: {ma['mean']:8.1f} / {ma['median']:8.1f} / "
+                f"{ma['p95']:8.1f} / {ma['max']:8.1f}"
+            )
+            lines.append("  per-scene host RSS  (MB)   mean / median /    p95 /    max")
+            lines.append(
+                f"    process peak   : {rs['mean']:8.1f} / {rs['median']:8.1f} / "
+                f"{rs['p95']:8.1f} / {rs['max']:8.1f}"
+            )
+            lines.append("  (reserved / nvidia-smi / RSS below are run-level high-water marks)")
+            lines.append(f"  GPU max_allocated: {s['gpu_alloc_gb']:.2f} GB")
+            lines.append(f"  GPU max_reserved : {s['gpu_reserved_gb']:.2f} GB")
+            lines.append(
+                f"  nvidia-smi used  : {s['gpu_smi_gb']:.2f} GB (Δ {s['gpu_smi_delta_gb']:+.2f} GB)"
+            )
+            lines.append(
+                f"  host RAM pk RSS  : {s['rss_peak_gb']:.2f} GB (Δ {s['rss_delta_gb']:+.2f} GB)"
+            )
+        lines.append("=========================================\n")
+        report = "\n".join(lines)
+        print(report)
+        try:
+            self.trainer.logger.info(report)
+        except Exception:
+            pass
+
+    def _write_csv(self, rows):
+        if not rows:
+            return
+        path = self.csv_path
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, exist_ok=True)
+        fields = [
+            "precision",
+            "name",
+            "num_voxels",
+            "num_origin_points",
+            "load_ms",
+            "h2d_ms",
+            "fwd_ms",
+            "backproj_ms",
+            "total_ms",
+            "gpu_alloc_mb",
+            "gpu_reserved_mb",
+            "rss_mb",
+            "rss_delta_mb",
+        ]
+        with open(path, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({k: r.get(k) for k in fields})
+        self.trainer.logger.info(f"Per-scene benchmark CSV written to {path}")
+        print(f"Per-scene benchmark CSV: {path}")
 
 
 

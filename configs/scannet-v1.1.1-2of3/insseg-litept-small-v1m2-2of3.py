@@ -66,10 +66,17 @@ model = dict(
     semantic_ignore_index=-1,
     segment_ignore_index=segment_ignore_index,
     instance_ignore_index=-1,
-    cluster_thresh=1.5,
-    cluster_closed_points=600,
-    cluster_propose_points=200,
-    cluster_min_points=50,
+    # Clustering tuned for the 2 mm dataset via tools/reeval_insseg_cluster_sweep.py
+    # (200-scene val sweep). The effective grouping radius = cluster_thresh * voxel_size.
+    # Objects here sit sub-mm apart, so the radius must be small: 2.5 * 0.002 = 5 mm
+    # peaks val mAP at ~0.73 (object AP 0.84), vs ~0.008 mAP at the legacy 3 cm radius
+    # that merged all neighbours. voxel_size MUST be set explicitly to the 2 mm grid;
+    # the __init__ default of 0.02 silently gave a 3 cm radius (the "2mm collapse" cause).
+    voxel_size=0.002,
+    cluster_thresh=2.5,           # 2.5 * 0.002 m = 5 mm physical radius
+    cluster_closed_points=3000,
+    cluster_propose_points=300,
+    cluster_min_points=100,
     criteria=[
         dict(
             type="CrossEntropyLoss",
@@ -100,7 +107,7 @@ optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
 scheduler = dict(
     type="OneCycleLR",
     max_lr=[0.006, 0.0006],
-    pct_start=0.05,
+    pct_start=0.005,
     anneal_strategy="cos",
     div_factor=10.0,
     final_div_factor=1000.0,
@@ -141,7 +148,7 @@ data = dict(
             dict(type="ChromaticJitter", p=0.95, std=0.05),
             dict(
                 type="GridSample",
-                grid_size=0.005,
+                grid_size=0.002,
                 hash_type="fnv",
                 mode="train",
                 return_grid_coord=True,
@@ -154,7 +161,7 @@ data = dict(
                 instance_ignore_index=-1,
             ),
             dict(type="ToTensor"),
-            dict(type="Update", keys_dict={"grid_size": 0.005}),
+            dict(type="Update", keys_dict={"grid_size": 0.002}),
             dict(
                 type="Collect",
                 keys=(
@@ -187,7 +194,7 @@ data = dict(
             ),
             dict(
                 type="GridSample",
-                grid_size=0.005,
+                grid_size=0.002,
                 hash_type="fnv",
                 mode="train",
                 return_grid_coord=True,
