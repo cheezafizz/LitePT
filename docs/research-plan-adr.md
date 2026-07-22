@@ -14,6 +14,9 @@ probe them, and their (always-provisional) conclusions.
   convenience only (they move/expire).
 - Durable write-ups promoted from agent state or notebooks land in `docs/` and are linked
   from the entry (see cleanup ADR #010).
+- **No commit SHAs** in entries — they rot under squash merges. Identify code by config
+  name, tool path, or commit subject.
+- **No `file:line` references** — lines drift. Refer to `file:method_name` instead.
 
 **Statuses:** `open` (question posed, no run yet) | `running` | `answered` (provisional) |
 `superseded-by-#QNNN` | `abandoned`
@@ -108,3 +111,20 @@ probe them, and their (always-provisional) conclusions.
 - Status: running
 - Runs: `-query-muon` vs `-query` race (epoch=40 budget from embed's epoch-21 best).
 - Conclusion: pending.
+
+## #Q012 — Do anti-merge losses (overlap repulsion, boundary-weighted BCE) fix query-mask merging of adjacent objects?
+- Date: 2026-07-22
+- Status: running
+- Hypothesis: MQ-v1m1 query masks bleed across touching (<1cm) objects; adding
+  (1) a pairwise query-mask overlap repulsion loss and/or (2) boundary/hard-token
+  weighting of the mask BCE sharpens instance boundaries without hurting mAP.
+- Runs: on top of the nosem parent (#Q008):
+  `-query-realft-muon-nosem-overlap` (Method 1 only),
+  `-query-realft-muon-nosem-bweight` (Method 2 only),
+  `-query-realft-muon-nosem-overlap-bweight` (both, launched 2026-07-22;
+  `loss_overlap_weight=1.0, boundary_weight=5.0, boundary_radius=1`).
+- Implementation: `models/mask_query/criterion.py:SetCriterion` (overlap loss +
+  boundary weighting), `models/mask_query/mask_query_v1m1.py:MaskQuery`.
+- Evidence so far: combined run at epoch 1/10 already at val mAP/AP50/AP25
+  0.956/0.973/0.979 (best AP50 0.9755) — no early sign of the losses hurting.
+- Conclusion: pending A/B of the three variants vs the plain nosem parent.
