@@ -17,6 +17,11 @@ probe them, and their (always-provisional) conclusions.
 - **No commit SHAs** in entries — they rot under squash merges. Identify code by config
   name, tool path, or commit subject.
 - **No `file:line` references** — lines drift. Refer to `file:method_name` instead.
+- **Decision commits:** when a question reaches `answered` and its outcome is adopted as a
+  semi-permanent part of the codebase (a config default, a tool behavior, a loss term), the
+  code embodying that decision lands in one dedicated commit whose subject references the
+  entry (e.g. `[FEAT] adopt 5mm cluster radius as 2of3 default (#Q001)`), separate from
+  exploratory/ablation commits. The entry's `Implication` line names that commit by subject.
 
 **Statuses:** `open` (question posed, no run yet) | `running` | `answered` (provisional) |
 `superseded-by-#QNNN` | `abandoned`
