@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONPATH=. python -c ' *)",
+      "Bash(PYTHONPATH=. /home/fai/miniconda3/envs/litept/bin/python -c ' *)",
+      "Bash(nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader)",
+      "Bash(nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv,noheader)",
+      "Bash(bash scripts/train.sh -p /home/fai/miniconda3/envs/litept/bin/python -d scannet-v1.1.1-2of3 -c insseg-litept-small-v1m2-2of3-benchmark -n insseg-litept-small-v1m2-2of3-benchmark -g 1)",
+      "Bash(echo \"EXIT_CODE=$?\")",
+      "Bash(break)",
+      "Bash(/home/fai/workspace/envs/litept/bin/python -c \"import open3d, numpy, scipy; print\\('open3d', open3d.__version__\\); print\\('scipy', scipy.__version__\\)\")",
+      "Bash(.venv-viser/bin/python tools/viser_insseg_viewer.py --insseg-root /home/fai/workspace/jhp/dataset/val_sample_output --insseg-subdir insseg_svdom_sv insseg_svdom_sv_model --host localhost --port 8081)",
+      "Bash(echo \"VISER_EXIT=$?\")",
+      "Bash(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader)",
+      "Bash(pkill -f \"insseg-litept-small-v1m2-2of3-query-realft-muon\")",
+      "Bash(nvidia-smi --query-gpu=memory.used --format=csv)",
+      "Bash(git push *)",
+      "Bash(git ls-remote *)",
+      "Bash(nvidia-smi --query-gpu=memory.used,memory.total --format=csv)",
+      "Bash(grep -n \"config_name\\\\|@hydra\" /home/fai/workspace/jhp/VisionSCO/save_instance_labels.py; sed -n 1,40p /home/fai/workspace/jhp/VisionSCO/conf/*.yaml 2>/dev/null | head -50; sed -n 780,840p /home/fai/workspace/jhp/VisionSCO/pipeline/connector.py)"
+    ],
+    "additionalDirectories": [
+      "/home/fai/workspace/jhp/VisionSCO/conf"
+    ]
+  }
+}
