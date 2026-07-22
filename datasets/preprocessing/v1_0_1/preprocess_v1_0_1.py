@@ -27,7 +27,6 @@ import os
 import warnings
 from concurrent.futures import ProcessPoolExecutor
 
-import h5py
 import numpy as np
 from PIL import Image
 from scipy.spatial import cKDTree
@@ -310,7 +309,7 @@ def map_labels(cat_raw, ann_raw, name_by_cat):
 
 
 def process_sequence(task):
-    seq_dir, scene_name, split_out_dir, voxel_size, force_instance = task
+    seq_dir, scene_name, split_out_dir, voxel_size, force_instance, crop_min, crop_max = task
     out_dir = os.path.join(split_out_dir, scene_name)
     inst_path = os.path.join(out_dir, "instance.npy")
     if os.path.isfile(inst_path) and not force_instance:
@@ -340,6 +339,8 @@ def process_sequence(task):
                 continue
             K, Tw2c, _ = cam_md[view]
             rgb = np.array(Image.open(img_path).convert("RGB"))
+            import h5py  # lazy: only the HDF5 depth path needs it (keeps compute_normals
+            # / voxel_first_hit importable in envs without h5py, e.g. the mask build)
             with h5py.File(dep_path, "r") as h:
                 depth = np.asarray(h["depth"][...], dtype=np.float32)
                 cat_map = np.asarray(h["instance_segmap"][...], dtype=np.int64)
@@ -368,11 +369,12 @@ def process_sequence(task):
         ann_raw = np.concatenate(anns, axis=0)
         cam_idx = np.concatenate(cam_idxs, axis=0)
 
-        # Restrict to the working volume (a cube of side 2 * WORKING_VOLUME_HALF
-        # centred on origin). Far-field points adds no instance signal and
-        # would inflate downstream merge / downsample / normal cost.
+        # Restrict to the working-volume AABB [crop_min, crop_max] (defaults to a
+        # cube of side 2 * WORKING_VOLUME_HALF centred on origin). Far-field points
+        # add no instance signal and would inflate downstream merge / downsample /
+        # normal cost.
         in_box = np.all(
-            (coord >= -WORKING_VOLUME_HALF) & (coord <= WORKING_VOLUME_HALF),
+            (coord >= crop_min) & (coord <= crop_max),
             axis=1,
         )
         if not in_box.any():
@@ -453,6 +455,14 @@ def main():
     parser.add_argument("--num_workers", type=int, default=mp.cpu_count())
     parser.add_argument("--voxel_size", type=float, default=0.005)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--crop_min", default=None,
+        help="Comma-separated 'x,y,z' min corner of the working-volume AABB (metres). "
+             "Default None => symmetric [-WORKING_VOLUME_HALF, +WORKING_VOLUME_HALF] cube.")
+    parser.add_argument(
+        "--crop_max", default=None,
+        help="Comma-separated 'x,y,z' max corner of the working-volume AABB (metres). "
+             "Default None => symmetric [-WORKING_VOLUME_HALF, +WORKING_VOLUME_HALF] cube.")
     parser.add_argument("--limit", type=int, default=0,
                         help="If >0, only process the first N sequences (post-split).")
     parser.add_argument("--force-instance", action="store_true",
@@ -463,6 +473,19 @@ def main():
                         help="Comma-separated 'scene_id:seq_id' pairs (e.g. '70:1001') "
                              "to limit processing to specific sequences. Empty = all.")
     args = parser.parse_args()
+
+    def _parse_corner(s, default):
+        if s is None:
+            return default
+        vals = [float(t) for t in s.split(",")]
+        if len(vals) != 3:
+            raise ValueError(f"expected 'x,y,z', got {s!r}")
+        return np.asarray(vals, dtype=np.float64)
+
+    crop_min = _parse_corner(args.crop_min, np.full(3, -WORKING_VOLUME_HALF))
+    crop_max = _parse_corner(args.crop_max, np.full(3, WORKING_VOLUME_HALF))
+    if np.any(crop_min >= crop_max):
+        raise ValueError(f"crop_min {crop_min} must be < crop_max {crop_max} on every axis")
 
     print(f"Enumerating sequences under {args.dataset_root} ...")
     sequences = enumerate_sequences(args.dataset_root)
@@ -496,11 +519,11 @@ def main():
         scene_name = f"scene{scn:02d}_{seq:04d}"
         tasks.append((
             sd, scene_name, os.path.join(args.output_root, split),
-            args.voxel_size, args.force_instance,
+            args.voxel_size, args.force_instance, crop_min, crop_max,
         ))
 
     print(f"Processing {len(tasks)} sequences with {args.num_workers} workers, "
-          f"voxel={args.voxel_size} m ...")
+          f"voxel={args.voxel_size} m, crop=[{crop_min.tolist()}, {crop_max.tolist()}] m ...")
     n_ok = n_fail = 0
     with ProcessPoolExecutor(max_workers=args.num_workers) as pool:
         for i, (name, status) in enumerate(pool.map(process_sequence, tasks), 1):

@@ -1,18 +1,24 @@
-"""Apply the TRAINING transform pipeline to a single preprocessed scene and save
-an eval-style GLB colored by GT instance labels.
+"""Apply a config's transform pipeline to a single preprocessed scene and save
+a GLB colored by GT instance labels.
 
 Unlike tools/visualize_scene.py (which renders the raw on-disk scene), this runs
-the exact `cfg.data.train.transform` chain — CenterShift, RandomRotate,
-RandomScale, RandomFlip, RandomJitter, ElasticDistortion, Chromatic*, GridSample,
-SphereCrop, NormalizeColor, InstanceParser — so you see what the model actually
-receives during training. Coloring + AABB boxes reuse the same helpers as the
-validation evaluator (engines/hooks/insseg_viz.py).
+an exact transform chain from the config so you see what the model actually
+receives. Pick the pipeline with --pipeline:
+  * train (default): `cfg.data.train.transform` — the full augmented chain
+    (CenterShift, RandomRotate/Scale/Flip, Chromatic*, GridSample, SphereCrop, ...),
+    i.e. what the model sees during training.
+  * val: `cfg.data.val.transform` — the deterministic, augmentation-free chain
+    used at evaluation/inference (CenterShift, GridSample, NormalizeColor, ...),
+    i.e. "as if it is done in evaluation".
+Coloring + AABB boxes reuse the same helpers as the validation evaluator
+(engines/hooks/insseg_viz.py).
 
 CPU-only: no model, no GPU.
 
 Usage:
+    # what the model receives at EVALUATION, on a train-split scene:
     python tools/visualize_transformed_scene.py \
-        --scene scene72_9456 --split val --save-rgb
+        --scene scene70_0001 --split train --pipeline val --save-rgb
 """
 import argparse
 import os
@@ -49,7 +55,10 @@ _DEFAULT_CONFIG = os.path.join(
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config-file", default=_DEFAULT_CONFIG,
-                   help="Training config whose data.train.transform is applied.")
+                   help="Config whose data.<pipeline>.transform is applied.")
+    p.add_argument("--pipeline", default="train", choices=["train", "val"],
+                   help="Which transform chain to apply: 'train' (augmented) or "
+                        "'val' (deterministic eval/inference pipeline).")
     p.add_argument("--scene", default="scene72_9456")
     p.add_argument("--split", default="val", choices=["train", "val", "test"],
                    help="Split directory the scene lives in (data_root/<split>/<scene>).")
@@ -75,16 +84,18 @@ def main():
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
 
-    out_dir = args.out or os.path.join("/tmp", f"{args.scene}_transformed")
+    suffix = "eval" if args.pipeline == "val" else "transformed"
+    out_dir = args.out or os.path.join("/tmp", f"{args.scene}_{suffix}")
 
     cfg = Config.fromfile(args.config_file)
-    scene_dir = os.path.join(cfg.data.train.data_root, args.split, args.scene)
+    pipeline_cfg = cfg.data.val if args.pipeline == "val" else cfg.data.train
+    scene_dir = os.path.join(pipeline_cfg.data_root, args.split, args.scene)
     if not os.path.isdir(scene_dir):
         raise SystemExit(f"scene dir not found: {scene_dir}")
 
-    # Build the train dataset (test_mode=False) and point it at the single scene
-    # so prepare_train_data runs the exact training transform chain on it.
-    dataset = build_dataset(cfg.data.train)
+    # Build the dataset (test_mode=False) and point it at the single scene so
+    # prepare_train_data runs the exact selected transform chain on it.
+    dataset = build_dataset(pipeline_cfg)
     dataset.data_list = [scene_dir]
     data = dataset[0]
 
@@ -111,15 +122,16 @@ def main():
     inst_s = inst[kept]
     gt_color = colorize_gt_instances(inst_s, ignore_value=IGNORE_INSTANCE)
 
-    gt_path = os.path.join(out_dir, f"{args.scene}_gt_transformed.glb")
+    gt_path = os.path.join(out_dir, f"{args.scene}_gt_{suffix}.glb")
     save_pointcloud_glb(gt_path, coord_s, gt_color, boxes=gt_boxes)
     if args.save_rgb:
-        rgb_path = os.path.join(out_dir, f"{args.scene}_rgb_transformed.glb")
+        rgb_path = os.path.join(out_dir, f"{args.scene}_rgb_{suffix}.glb")
         save_pointcloud_glb(rgb_path, coord_s, color_s)
 
     seed_note = "random" if args.seed < 0 else f"seed={args.seed}"
     print("=" * 72)
-    print(f"scene {args.scene} ({args.split}) — TRAIN transforms applied ({seed_note})")
+    print(f"scene {args.scene} ({args.split}) — {args.pipeline.upper()} transforms "
+          f"applied ({seed_note})")
     print("=" * 72)
     print(f"  points after transforms: {coord.shape[0]:,}  ->  "
           f"{coord_s.shape[0]:,} after {args.voxel_size} m downsample")

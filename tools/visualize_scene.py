@@ -37,6 +37,9 @@ def parse_args():
                    help="Output directory (default: /tmp/<scene>)")
     p.add_argument("--min-region-size", type=int, default=100,
                    help="Drop GT instances with fewer points than this from AABB overlay.")
+    p.add_argument("--voxel-size", type=float, default=GRID_SIZE,
+                   help="Voxel size (m) for the GLB downsample. Use <= 0 for full "
+                        "resolution (no downsample).")
     return p.parse_args()
 
 
@@ -88,8 +91,12 @@ def main():
         pts = coord[m]
         gt_boxes.append((pts.min(0), pts.max(0), palette[k]))
 
-    # 0.005 m voxel downsample for lighter GLBs (same as evaluator.py:494).
-    kept = voxel_downsample_indices(coord, GRID_SIZE)
+    # Voxel downsample for lighter GLBs (default 0.005 m, same as evaluator.py:494);
+    # --voxel-size <= 0 keeps full resolution.
+    if args.voxel_size > 0:
+        kept = voxel_downsample_indices(coord, args.voxel_size)
+    else:
+        kept = np.arange(coord.shape[0])
     coord_s = coord[kept]
     color_s = color[kept].astype(np.uint8)
     instance_s = instance[kept]
@@ -100,8 +107,9 @@ def main():
     save_pointcloud_glb(rgb_path, coord_s, color_s)
     save_pointcloud_glb(gt_path, coord_s, gt_color, boxes=gt_boxes)
 
+    grid_note = f"{args.voxel_size} m" if args.voxel_size > 0 else "full-res"
     print(f"downsampled: {coord.shape[0]:,} -> {coord_s.shape[0]:,} points "
-          f"(grid={GRID_SIZE} m), {len(gt_boxes)} GT boxes drawn "
+          f"(grid={grid_note}), {len(gt_boxes)} GT boxes drawn "
           f"(>= {args.min_region_size} pts)")
     print(f"wrote {rgb_path}")
     print(f"wrote {gt_path}")
