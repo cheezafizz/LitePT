@@ -59,7 +59,7 @@ Append-only decision ledger for repo hygiene / environment cleanup.
 
 ## #005 — Triage the untracked configs and tools scripts (commit, don't scratch)
 - Date: 2026-07-22
-- Status: proposed
+- Status: done
 - Context: ~43 untracked configs under `configs/scannet-v1.1.1-2of3/` and ~30 untracked
   `tools/` scripts are real work products — they are the reproducibility record of the
   ablation grid and the VGGT/clustering pipelines. 9 tracked files also carry +1,374
