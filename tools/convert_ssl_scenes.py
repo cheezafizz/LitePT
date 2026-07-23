@@ -66,14 +66,25 @@ def _camera_origins(camera_json):
     """camera.json -> (V, 3) world-space camera centers, in file order.
 
     Entries hold world-to-camera R (3x3) and t (3,): center c = -R^T @ t.
+    Many 80k scenes lack true R/t and instead carry backfilled pseudo_R/pseudo_t
+    (borrowed from the same machine) or weak_pseudo_R/weak_pseudo_t (different
+    machine) — see tools/fill_pseudo_extrinsics.py. Fall back in that order;
+    return None if any camera has no extrinsics at all (caller then uses the
+    virtual top-down camera for the whole scene).
     """
     with open(camera_json) as f:
         cams = json.load(f)["cameras"]
     origins = []
     for cam in cams:
-        R = np.asarray(cam["R"], dtype=np.float64).reshape(3, 3)
-        t = np.asarray(cam["t"], dtype=np.float64).reshape(3)
-        origins.append(-R.T @ t)
+        for rk, tk in (("R", "t"), ("pseudo_R", "pseudo_t"),
+                       ("weak_pseudo_R", "weak_pseudo_t")):
+            if rk in cam and tk in cam:
+                R = np.asarray(cam[rk], dtype=np.float64).reshape(3, 3)
+                t = np.asarray(cam[tk], dtype=np.float64).reshape(3)
+                origins.append(-R.T @ t)
+                break
+        else:
+            return None
     return np.asarray(origins, dtype=np.float32)
 
 
@@ -107,8 +118,8 @@ def convert_scene(
     cam_json = (
         os.path.join(camera_root, scene, "camera.json") if camera_root else None
     )
-    if cam_json and os.path.isfile(cam_json):
-        origins = _camera_origins(cam_json)
+    origins = _camera_origins(cam_json) if cam_json and os.path.isfile(cam_json) else None
+    if origins is not None:
         cam_idx = np.clip(view_ids, 0, len(origins) - 1)
     else:
         center = coord.mean(axis=0)
@@ -139,6 +150,46 @@ def convert_scene(
     return dict(points=coord.shape[0], instances=next_id)
 
 
+def _write_run_config(args) -> None:
+    """Append this launch's provenance to <out-root>/run_config.jsonl:
+    source dataset, converting script (+ git commit), and all CLI args.
+    Also copies the source's own run_config.jsonl forward if present."""
+    import datetime
+    import json
+    import shutil
+    import socket
+    import subprocess
+
+    def _git(*cmd):
+        try:
+            return subprocess.run(
+                ["git", *cmd], cwd=os.path.dirname(os.path.abspath(__file__)),
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+        except Exception:
+            return ""
+
+    os.makedirs(args.out_root, exist_ok=True)
+    record = {
+        "launched_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "hostname": socket.gethostname(),
+        "script": os.path.abspath(__file__),
+        "source_dataset": os.path.abspath(args.ssl_root),
+        "args": vars(args),
+        "git": {
+            "commit": _git("rev-parse", "HEAD"),
+            "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
+            "dirty": bool(_git("status", "--porcelain")),
+        },
+    }
+    with open(os.path.join(args.out_root, "run_config.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    # chain of custody: carry the source dataset's provenance forward
+    src_rc = os.path.join(args.ssl_root, "run_config.jsonl")
+    if os.path.isfile(src_rc):
+        shutil.copy(src_rc, os.path.join(args.out_root, "source_run_config.jsonl"))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ssl-root", required=True)
@@ -151,6 +202,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--workers", type=int, default=1)
     args = ap.parse_args()
+    _write_run_config(args)
 
     npzs = sorted(
         f for f in os.listdir(args.ssl_root) if f.endswith(".npz")
