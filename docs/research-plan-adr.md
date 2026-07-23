@@ -133,3 +133,20 @@ probe them, and their (always-provisional) conclusions.
 - Evidence so far: combined run at epoch 1/10 already at val mAP/AP50/AP25
   0.956/0.973/0.979 (best AP50 0.9755) — no early sign of the losses hurting.
 - Conclusion: pending A/B of the three variants vs the plain nosem parent.
+
+## #Q013 — Do v2 pseudo-labels (per-store classifiers + volume priors) improve the real-scene finetune?
+
+- Date: 2026-07-23
+- Status: running
+- Hypothesis: the v1 pseudo-label flaw (single shared classifier feeding
+  use_cls_similarity matching) corrupted v1 seg_ids; the v2 export (per-store
+  classifiers, products.csv skuSizes volume priors) yields cleaner instance
+  labels and therefore a better -query-realft-muon finetune at the same recipe.
+- Run: `-query-realft-muon-v2` on `data/real-ssl-v2`, auto-launched by
+  `tools/watch_v2_then_train.sh` when the ssl_labels_v2 80k export finishes
+  (~2026-07-25); config identical to the v1 muon leg except the real data root.
+- Implementation: `tools/convert_ssl_scenes.py` (pseudo-extrinsics fallback,
+  provenance), configs `-query-realft-v2` / `-query-realft-muon-v2`.
+- Caveat: v2 normals are camera-oriented (--camera-root) while v1 used the
+  virtual top-down camera — a small known confound in the v1-vs-v2 A/B.
+- Conclusion: pending.
