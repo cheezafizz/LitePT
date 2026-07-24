@@ -28,7 +28,9 @@ count_npz() { ls "$SSL_ROOT"/*.npz 2>/dev/null | wc -l; }
 export_alive() { docker exec ssl_labels_v2 pgrep -f save_instance_labels.py > /dev/null 2>&1; }
 export_done() { grep -q "DONE:" "$EXPORT_LOG"; }
 
+LAUNCH_TS=0
 launch_export() {
+    LAUNCH_TS=$(date +%s)
     # HANDOFF.md Step 2, resume mode (do NOT wipe outputs)
     setsid nohup docker exec -w /workspace \
         -e SSL_DATA_ROOT=/data -e SSL_OUTPUT_ROOT=/out -e SSL_PRODUCTS_DIR=/products \
@@ -55,7 +57,10 @@ until export_done; do
     # (D-state, seen 2026-07-24) — alive but writing nothing. We cannot kill it
     # (SIGKILL undeliverable; docker kill fails; host reboot required), so alert
     # loudly and keep waiting.
-    if export_alive && [ "$(newest_npz_age)" -gt 1800 ]; then
+    # (grace period after a relaunch: the newest npz is legitimately old until
+    # the resumed export catches up past the skip-scan)
+    if export_alive && [ "$(newest_npz_age)" -gt 1800 ] \
+            && [ $(( $(date +%s) - LAUNCH_TS )) -gt 2700 ]; then
         log "ALERT: export process alive but NO new scene for 30+ min — likely kernel-deadlocked (D-state). A HOST REBOOT + tools/recover_v2_after_reboot.sh is needed."
         sleep 1800
         continue

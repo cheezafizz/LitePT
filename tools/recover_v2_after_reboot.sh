@@ -7,15 +7,16 @@ cd "$(dirname "$0")/.."
 
 SSL_ROOT=/home/fai/workspace/jhp/ssl_labels_out_v2
 
-# 1. Drop the scene that was (possibly mid-)written when the process wedged —
-#    resume skips scenes whose outputs exist, so a truncated npz would never heal.
-LAST=1_003_022_000208
-echo "removing possibly-truncated outputs of $LAST"
-rm -f "$SSL_ROOT/$LAST.npz" "$SSL_ROOT/dets/${LAST}_dets.npz"
-
-# 2. Bring the export container back (it does not auto-start).
+# 1. Bring the export container back (it does not auto-start).
 docker start ssl_labels_v2
 sleep 5
+
+# 2. Drop the scene that was (possibly mid-)written when the process wedged —
+#    resume skips scenes whose outputs exist, so a truncated npz would never
+#    heal. Outputs are root-owned (container writes), so delete via the container.
+LAST=1_003_022_000208
+echo "removing possibly-truncated outputs of $LAST"
+docker exec ssl_labels_v2 rm -f "/out/$LAST.npz" "/out/dets/${LAST}_dets.npz"
 docker ps --filter name=ssl_labels_v2 --format 'container: {{.Status}}'
 
 # 3. Relaunch the supervisor: it relaunches the export in resume mode and, on
