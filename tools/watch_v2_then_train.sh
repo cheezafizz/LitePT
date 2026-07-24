@@ -44,7 +44,22 @@ if ! export_alive && ! export_done; then
     launch_export
 fi
 
+newest_npz_age() {
+    local f
+    f=$(ls -t "$SSL_ROOT"/*.npz 2>/dev/null | head -1) || { echo 999999; return; }
+    echo $(( $(date +%s) - $(stat -c %Y "$f") ))
+}
+
 until export_done; do
+    # Stall detector: the process can wedge in an unkillable kernel deadlock
+    # (D-state, seen 2026-07-24) — alive but writing nothing. We cannot kill it
+    # (SIGKILL undeliverable; docker kill fails; host reboot required), so alert
+    # loudly and keep waiting.
+    if export_alive && [ "$(newest_npz_age)" -gt 1800 ]; then
+        log "ALERT: export process alive but NO new scene for 30+ min — likely kernel-deadlocked (D-state). A HOST REBOOT + tools/recover_v2_after_reboot.sh is needed."
+        sleep 1800
+        continue
+    fi
     if ! export_alive; then
         n=$(count_npz)
         if [ $((n - last_count)) -lt "$MIN_PROGRESS" ]; then
