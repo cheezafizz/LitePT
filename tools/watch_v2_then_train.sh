@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
-# Watch the ssl_labels_v2 export container; when the export process exits,
-# convert ssl_labels_out_v2 -> data/real-ssl-v2 (resumable) and launch the
-# -query-realft-muon-v2 finetune detached.
+# Supervise the ssl_labels_v2 export to completion, then convert
+# ssl_labels_out_v2 -> data/real-ssl-v2 and launch -query-realft-muon-v2.
+#
+# The export dies randomly every few thousand scenes with native heap
+# corruption (double free / munmap_chunk — different scenes each time, so not
+# scene-deterministic). It is resumable (skips scenes with npz+dets), so this
+# script relaunches it after every crash as long as each leg makes progress
+# (>= MIN_PROGRESS new scenes), and treats the exporter's "DONE:" log line as
+# the real completion signal.
 #
 # Launch (detached — survives the launching session, NOT a host reboot):
 #   setsid nohup bash tools/watch_v2_then_train.sh > logs/watch_v2_then_train.log 2>&1 &
@@ -13,23 +19,50 @@ SSL_ROOT=/home/fai/workspace/jhp/ssl_labels_out_v2
 CAM_ROOT=/home/fai/workspace/jhp/dataset/SSL_dataset/dataset_ssl_1_80k
 OUT_ROOT=data/real-ssl-v2
 CONFIG=insseg-litept-small-v1m2-2of3-query-realft-muon-v2
-MIN_SCENES=60000   # abort if the export "finished" with far fewer than 80k scenes
+EXPORT_LOG="$SSL_ROOT/full_run.log"
+MIN_PROGRESS=50    # a retry leg must add at least this many scenes, else abort
+MAX_RETRIES=100
 
 log() { echo "[$(date '+%F %T')] $*"; }
+count_npz() { ls "$SSL_ROOT"/*.npz 2>/dev/null | wc -l; }
+export_alive() { docker exec ssl_labels_v2 pgrep -f save_instance_labels.py > /dev/null 2>&1; }
+export_done() { grep -q "DONE:" "$EXPORT_LOG"; }
 
-log "watching container ssl_labels_v2 for save_instance_labels exit..."
-while docker exec ssl_labels_v2 pgrep -f save_instance_labels.py > /dev/null 2>&1; do
-    sleep 600
-done
-log "export process gone; settling 120s"
-sleep 120
+launch_export() {
+    # HANDOFF.md Step 2, resume mode (do NOT wipe outputs)
+    setsid nohup docker exec -w /workspace \
+        -e SSL_DATA_ROOT=/data -e SSL_OUTPUT_ROOT=/out -e SSL_PRODUCTS_DIR=/products \
+        -e "SSL_CLIP_BOX=-0.4,0.6,-0.5,0.7,-0.2,0.7" -e SSL_BG_VOXEL_MM=10 \
+        ssl_labels_v2 python3 save_instance_labels.py \
+        >> "$EXPORT_LOG" 2>&1 &
+}
 
-N_NPZ=$(ls "$SSL_ROOT"/*.npz 2>/dev/null | wc -l)
-log "npz count: $N_NPZ"
-if [ "$N_NPZ" -lt "$MIN_SCENES" ]; then
-    log "ABORT: only $N_NPZ scenes (< $MIN_SCENES) — export likely crashed, not finished. NOT converting/training."
-    exit 1
+retries=0
+last_count=$(count_npz)
+if ! export_alive && ! export_done; then
+    log "export not running (count $last_count); launching"
+    launch_export
 fi
+
+until export_done; do
+    if ! export_alive; then
+        n=$(count_npz)
+        if [ $((n - last_count)) -lt "$MIN_PROGRESS" ]; then
+            log "ABORT: export died at $n scenes with < $MIN_PROGRESS progress since last relaunch ($last_count) — crash-looping, needs a human."
+            exit 1
+        fi
+        retries=$((retries + 1))
+        [ "$retries" -le "$MAX_RETRIES" ] || { log "ABORT: exceeded $MAX_RETRIES relaunches."; exit 1; }
+        log "export died at $n scenes (+$((n - last_count)) this leg); relaunch #$retries"
+        last_count=$n
+        launch_export
+        sleep 60
+    fi
+    sleep 300
+done
+
+log "export DONE ($(count_npz) scenes, $retries relaunches); settling 60s"
+sleep 60
 
 log "converting to $OUT_ROOT (resumable)..."
 "$PY" tools/convert_ssl_scenes.py \
