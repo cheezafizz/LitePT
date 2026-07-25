@@ -24,7 +24,9 @@ MIN_PROGRESS=50    # a retry leg must add at least this many scenes, else abort
 MAX_RETRIES=100
 
 log() { echo "[$(date '+%F %T')] $*"; }
-count_npz() { ls "$SSL_ROOT"/*.npz 2>/dev/null | wc -l; }
+# find, not ls/glob: at ~30k+ files the glob exceeds ARG_MAX and ls fails,
+# silently yielding count 0 (caused a wrongful crash-loop ABORT on 2026-07-25)
+count_npz() { find "$SSL_ROOT" -maxdepth 1 -name '*.npz' 2>/dev/null | wc -l; }
 export_alive() { docker exec ssl_labels_v2 pgrep -f save_instance_labels.py > /dev/null 2>&1; }
 export_done() { grep -q "DONE:" "$EXPORT_LOG"; }
 
@@ -47,9 +49,11 @@ if ! export_alive && ! export_done; then
 fi
 
 newest_npz_age() {
-    local f
-    f=$(ls -t "$SSL_ROOT"/*.npz 2>/dev/null | head -1) || { echo 999999; return; }
-    echo $(( $(date +%s) - $(stat -c %Y "$f") ))
+    local ts
+    ts=$(find "$SSL_ROOT" -maxdepth 1 -name '*.npz' -printf '%T@\n' 2>/dev/null \
+         | sort -rn | head -1 | cut -d. -f1)
+    [ -n "$ts" ] || { echo 999999; return; }
+    echo $(( $(date +%s) - ts ))
 }
 
 until export_done; do
