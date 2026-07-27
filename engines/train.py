@@ -309,25 +309,34 @@ class Trainer(TrainerBase):
         self.logger.info(f"Tensorboard writer logging dir: {self.cfg.save_path}")
         if self.cfg.enable_wandb and comm.is_main_process():
             tag, name = Path(self.cfg.save_path).parts[-2:]
+            # Reattach to the original wandb run on resume instead of minting a new
+            # run per restart (crash/resume otherwise splits one training across
+            # several dashboard runs, and few-point stub runs render as bar charts).
+            # The run id is persisted next to the checkpoints on first init.
+            run_id_file = Path(self.cfg.save_path) / "wandb_run_id.txt"
+            run_id = None
             if self.cfg.resume:
-                wandb.init(
-                    project=self.cfg.wandb_project,
-                    name=f"{tag}/{name}",
-                    tags=[tag],
-                    # id=self.cfg.wandb_id,
-                    dir=self.cfg.save_path,
-                    settings=wandb.Settings(api_key=self.cfg.wandb_key),
-                    config=self.cfg,
-                )
-            else:
-                wandb.init(
-                    project=self.cfg.wandb_project,
-                    name=f"{tag}/{name}",
-                    tags=[tag],
-                    dir=self.cfg.save_path,
-                    settings=wandb.Settings(api_key=self.cfg.wandb_key),
-                    config=self.cfg,
-                )
+                if run_id_file.is_file():
+                    run_id = run_id_file.read_text().strip() or None
+                else:
+                    # Older runs predate the id file; fall back to the id encoded in
+                    # the latest local run dir (wandb/run-<timestamp>-<id>).
+                    latest = Path(self.cfg.save_path) / "wandb" / "latest-run"
+                    if latest.exists():
+                        run_id = Path(os.path.realpath(latest)).name.split("-")[-1]
+            run = wandb.init(
+                project=self.cfg.wandb_project,
+                name=f"{tag}/{name}",
+                tags=[tag],
+                id=run_id,
+                # "allow" resumes the run if it exists but still starts cleanly if
+                # the server has no such run (e.g. the original never synced).
+                resume="allow" if run_id else None,
+                dir=self.cfg.save_path,
+                settings=wandb.Settings(api_key=self.cfg.wandb_key),
+                config=self.cfg,
+            )
+            run_id_file.write_text(run.id)
         return writer
 
     def build_train_loader(self):
